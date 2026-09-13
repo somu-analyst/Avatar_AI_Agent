@@ -98,6 +98,38 @@ Tested Docker-sandboxed Open Interpreter on the Oracle VM (2026-09-12).
   TalkingHead's `lipsyncModules: ["en"]`. Real, multi-file scope -- not a
   quick add.
 
+## In progress — photorealistic avatar (SadTalker), 2026-09-13
+Goal: real GPU-based talking-head video generation, for live speaking first
+(no true real-time expected -- rendering takes minutes) and the backlogged
+YouTube pipeline second. Explicitly want fallback redundancy across free GPU
+sources, not one path.
+- **Colab (camenduru/SadTalker-colab fork)**: hit a real, structural problem,
+  not a one-off bug -- `requirements.txt` pins 2022-era versions
+  (numpy==1.23.4, scikit-image==0.19.3, face_alignment==1.3.5, etc.) that
+  have no prebuilt wheels for Colab's now-default Python 3.12, so pip tries
+  to build them from source and aborts the WHOLE install the moment one
+  fails (egg_info error) -- everything listed after it in the file (kornia,
+  facexlib, ...) silently never installs. Explains both the kornia and
+  facexlib `ModuleNotFoundError`s as the same root cause, not two bugs.
+  Fix given: drop the pins, `pip install` the package names bare so pip
+  picks 3.12-compatible wheels. Not yet confirmed working by you.
+- **Kaggle**: built and ran an actual kernel end to end --
+  `srinivasaraosomu/sadtalker-avatar-test` (private). Clones SadTalker,
+  installs `requirements.txt` AS PINNED (Kaggle's Python is older, matches
+  the 2022 pins natively -- no source-build problem here), downloads all
+  checkpoints (~1.7GB, confirmed on disk: both safetensors + both mapping
+  models), runs `inference.py` on the bundled example image/audio. Kernel
+  finished with status COMPLETE, but the run log came back 0 bytes on the
+  first pull -- looked like the same Windows-console UTF-8 encoding crash
+  as the Kokoro TTS bug (tqdm/aria2c progress output has non-ASCII chars),
+  not a Kaggle-side failure. Re-pulling with `PYTHONUTF8=1` /
+  `PYTHONIOENCODING=utf-8` to get the real log and confirm whether
+  `inference.py` actually produced a result video or died partway --
+  **unresolved as of this entry**, no `results/*.mp4` seen in the output
+  yet.
+- **Hugging Face Spaces**: found a working alternative (John6666/SadTalker,
+  confirmed live) -- not yet tried.
+
 ## Open questions (waiting on you)
 - **Gmail access** -- you asked for "all the daily used" APIs including
   Gmail; this is a different risk category than the public read-only APIs

@@ -25,6 +25,8 @@ import sounddevice as sd
 import webrtcvad
 from faster_whisper import WhisperModel
 
+import tools as _tools
+
 MODEL = "llama3.2:3b"
 SAMPLE_RATE = 16000
 # Ollama unloads an idle model by default, which is exactly why the first
@@ -41,7 +43,11 @@ SYSTEM_PROMPT = """You are Krishna, a warm, direct, knowledgeable personal compa
 advisor. You speak naturally and conversationally, like a trusted friend who has real
 expertise -- not like a corporate assistant. Keep responses short and spoken-natural
 (1-3 sentences unless genuinely more is needed) since this is a VOICE conversation, not
-a chat window. Be honest and specific rather than generically encouraging."""
+a chat window. Be honest and specific rather than generically encouraging.
+When a tool result appears in the conversation, that is REAL, current data you just
+looked up -- state it directly and specifically (the actual number/fact), in your own
+natural voice. Never deflect, joke about not knowing, or hedge with "check elsewhere"
+when you were just given the real answer -- that's actively wrong, not humble."""
 
 
 def load_history() -> list[dict]:
@@ -269,12 +275,44 @@ def speak_interruptible(tts_pipeline, text: str) -> bool:
 _SENTENCE_END = re.compile(r"[.!?]+(?:\s|$)")
 
 
+_TOOL_FUNCS = {f.__name__: f for f in _tools.ALL_TOOLS}
+
+
+def _resolve_tools(model: str, history: list) -> list:
+    """One non-streaming pre-pass to check if the model wants a live-data
+    tool (weather/currency/dictionary/jokes -- see tools.py) before actually
+    answering. This is THE fix for "my knowledge cutoff is December 2023":
+    no local model can know anything past its training cutoff no matter how
+    it's prompted -- the only real fix is fetching live data and handing it
+    to the model as context for THIS answer, which is what this does.
+    Returns history unchanged if no tool was needed (the common case), or
+    history + the tool call + its real result appended, ready for the
+    caller to get a final answer grounded in that real data."""
+    check = ollama.chat(model=model, messages=history, tools=_tools.ALL_TOOLS,
+                        keep_alive=KEEP_ALIVE)
+    calls = check["message"].get("tool_calls")
+    if not calls:
+        return history
+    working = history + [check["message"]]
+    for call in calls:
+        fn = _TOOL_FUNCS.get(call["function"]["name"])
+        if not fn:
+            continue
+        try:
+            result = fn(**call["function"]["arguments"])
+        except Exception as e:
+            result = f"Tool call failed: {e}"
+        working.append({"role": "tool", "content": str(result)})
+    return working
+
+
 def think(model: str, history: list) -> str:
     """Non-streaming reply, whole thing at once -- used by the avatar path,
     which needs the complete text before it can synthesize+time it as one
     piece. Trades away think_and_speak()'s first-sentence-latency win in
     exchange for a simpler, correct avatar integration; the console/plain-
     voice path keeps using think_and_speak() for that speed."""
+    history = _resolve_tools(model, history)
     response = ollama.chat(model=model, messages=history, keep_alive=KEEP_ALIVE)
     return response["message"]["content"]
 
@@ -286,7 +324,12 @@ def think_and_speak(tts_pipeline, model: str, history: list) -> str:
     most of what actually makes ChatGPT/Grok voice feel fast. keep_alive
     keeps the model warm so only the very first turn in a session pays a
     reload cost. Checks for an Enter-press between sentences too, so a long
-    reply can be cut off partway through, not just within one sentence."""
+    reply can be cut off partway through, not just within one sentence.
+    Also checks for a live-data tool need first (weather/currency/etc,
+    same as think()) -- costs one extra non-streaming round trip on every
+    turn, but that's the price of Krishna reliably knowing to reach for
+    real data instead of guessing from a frozen training cutoff."""
+    history = _resolve_tools(model, history)
     buffer = ""
     full_reply = ""
     stream = ollama.chat(model=model, messages=history, stream=True,
