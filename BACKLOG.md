@@ -44,15 +44,67 @@ Tested Docker-sandboxed Open Interpreter on the Oracle VM (2026-09-12).
   persistently mounted -- a smooth version needs a proper custom Streamlit
   component, not built.
 
+- **Mouth-moving-when-idle bug** -- root cause: `_avatar_payload` never got
+  cleared from session_state, so ANY Streamlit rerun (any click anywhere,
+  not just a new reply) re-triggered `speakAudio()` on stale audio. Fixed
+  with a turn-id check: only the first render of a given reply actually
+  speaks, later reruns show the idle face.
+- **TTS crash on certain text** -- Kokoro's G2P (misaki) can raise
+  `TypeError: unsupported operand type(s) for +: 'NoneType' and 'str'` on
+  some text instead of failing gracefully, which took the whole Streamlit
+  app down mid-reply (caught live). Fixed: text sanitized before synthesis,
+  and the call wrapped so a TTS failure just goes unspoken instead of
+  crashing.
+- **In-app restart button** -- a plain page refresh doesn't pick up edits to
+  `krishna.py`/`avatar_widget.py` (Python caches them on import). Built a
+  `supervisor.py` that keeps relaunching the Streamlit server whenever it
+  exits, plus a "🔄 Restart" button that kills the current process on
+  purpose -- the supervisor notices and starts a fresh one, which re-imports
+  everything from disk.
+- **Git repo created and pushed** -- https://github.com/somu-analyst/Avatar_AI_Agent,
+  `main` branch, commit `1588266`.
+
+## In progress / next up
+- **Chatterbox TTS** -- installed (verified importable), not yet wired in
+  to replace Kokoro. Quality reasoning: blind listening study showed 65.3%
+  preferred Chatterbox Turbo over ElevenLabs.
+- **Tool-calling for live data** -- researched and picked, not yet built:
+  Open-Meteo (weather, no key), Frankfurter/Exchangerate.host (currency, no
+  key), Free Dictionary API (no key), Nager.Date (holidays/calendar, no
+  key), JokeAPI (no key), Currents API (news, free signup needed -- you'd
+  need to grab a key).
+
+## Open questions (waiting on you)
+- **Gmail access** -- you asked for "all the daily used" APIs including
+  Gmail; this is a different risk category than the public read-only APIs
+  above (OAuth into your actual inbox, not a public lookup). Waiting on an
+  explicit yes specifically for this, not folded into the general API ask.
+- **"Autonomous bot" scope** -- asked whether you mean (a) Krishna looks
+  things up when you ask it to (safe, what the tool-calling above is), or
+  (b) something that acts without you prompting each time (the same
+  always-listening-style autonomy category you were cautious about
+  earlier). Not yet answered.
+- **Realistic/photorealistic avatar** -- explicitly deferred ("we will do
+  that realistic later"). Real finding from research: no existing hardware
+  (laptop: AMD integrated graphics, no CUDA; Oracle VM: ARM CPU-only, no
+  GPU at all) can run any of the real-time-capable options (LiveAvatar
+  needs 80GB VRAM; MuseTalk/SadTalker-based systems assume NVIDIA GPU).
+  Would need a rented cloud GPU (RunPod/Vast.ai, roughly $0.50-2 for a
+  bounded test) -- real cost, needs your payment method and explicit go-
+  ahead when you're ready.
+- **Indian face** -- still needs you to create one at readyplayer.me
+  (photo or manual customization) and send me the `.glb` -- I can't
+  fabricate a correctly-rigged one myself.
+- **Telugu / Indian-accent voice** -- AI4Bharat's IndicF5/Indic-Parler-TTS
+  (Telugu) vs. MeloTTS (Indian-accented English) vs. Kokoro (neither) --
+  still waiting on which matters more.
+
 ## Backlog (not being built now)
 - **Open Interpreter on the laptop instead of the VM** -- 6 cores vs the
   VM's 2, likely fast enough. Would need its own sandboxing (Docker Desktop
   on Windows) since it'd be running where your real files live.
 - **Cloud LLM behind the sandbox** -- solves the speed problem, reopens the
   "does data leave the machine" question.
-- **Telugu / Indian-accent voice** -- AI4Bharat's IndicF5 or Indic-Parler-TTS
-  (Telugu-capable) vs. MeloTTS (Indian-accented English) vs. Kokoro (no
-  Telugu, English/Hindi only) -- still waiting on which matters more.
 - **Always-listening / wake-word mode** -- explicitly paused pending
   confirmation, given the autonomy/control concern raised earlier. Off by
   default if ever built; push-to-talk remains the norm until decided
