@@ -168,6 +168,28 @@ def _sanitize_for_tts(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+# Kokoro ships ~54 built-in voices; this is a curated, verified-real subset
+# (naming convention: a=American/b=British, f=female/m=male) rather than the
+# full list -- single-user local app, so a module-level "current voice" is
+# simpler than threading a parameter through every call site (synthesize,
+# speak, speak_interruptible, think_and_speak all funnel through here).
+VOICE_OPTIONS = {
+    "Heart (US female, default)": "af_heart",
+    "Bella (US female)": "af_bella",
+    "Nicole (US female)": "af_nicole",
+    "Adam (US male)": "am_adam",
+    "Michael (US male)": "am_michael",
+    "Emma (British female)": "bf_emma",
+    "George (British male)": "bm_george",
+}
+CURRENT_VOICE = "af_heart"
+
+
+def set_voice(voice_id: str) -> None:
+    global CURRENT_VOICE
+    CURRENT_VOICE = voice_id
+
+
 def _safe_tts_chunks(tts_pipeline, text: str):
     """Kokoro's G2P can crash with `TypeError: unsupported operand type(s)
     for +: 'NoneType' and 'str'` on certain text (a token gets no phonemes
@@ -179,7 +201,7 @@ def _safe_tts_chunks(tts_pipeline, text: str):
     if not safe_text:
         return
     try:
-        yield from tts_pipeline(safe_text, voice="af_heart")
+        yield from tts_pipeline(safe_text, voice=CURRENT_VOICE)
     except Exception as e:
         print(f"[krishna] TTS failed on this text, skipping speech: {e}")
         return

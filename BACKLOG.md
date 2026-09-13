@@ -64,6 +64,12 @@ Tested Docker-sandboxed Open Interpreter on the Oracle VM (2026-09-12).
 - **Git repo created and pushed** -- https://github.com/somu-analyst/Avatar_AI_Agent,
   `main` branch, commit `1588266`.
 
+## Done (this pass)
+- **Voice picker** -- `st.selectbox` in the UI, 7 curated Kokoro voices
+  (verified real by actually generating audio with each, not assumed from
+  a naming convention): Heart/Bella/Nicole (US female), Adam/Michael (US
+  male), Emma (British female), George (British male).
+
 ## In progress / next up
 - **Chatterbox TTS** -- installed (verified importable), not yet wired in
   to replace Kokoro. Quality reasoning: blind listening study showed 65.3%
@@ -72,7 +78,25 @@ Tested Docker-sandboxed Open Interpreter on the Oracle VM (2026-09-12).
   Open-Meteo (weather, no key), Frankfurter/Exchangerate.host (currency, no
   key), Free Dictionary API (no key), Nager.Date (holidays/calendar, no
   key), JokeAPI (no key), Currents API (news, free signup needed -- you'd
-  need to grab a key).
+  need to grab a key). Elaborated: should fire mid-conversation when
+  relevant (news, current events, stocks/live prices, sports, weather) --
+  needs actual LLM tool-calling wired up (the model decides when to reach
+  for a tool), not just standalone functions. Stocks/live-prices/sports
+  need their own source research -- not yet picked (existing job-search-
+  copilot/NYSE_DATA projects have Finnhub etc. for market data, worth
+  checking if that's reusable before finding something new).
+- **Avatar picker** -- choose between multiple avatar faces. Only one
+  avatar (brunette.glb) exists right now; needs more correctly-rigged
+  avatars (same ARKit+Oculus+Mixamo requirement as before) before a picker
+  means anything.
+- **Background picker** -- currently a fixed dark color behind the avatar;
+  needs a background-image/color option in avatar_widget.py.
+- **Multi-language support** -- "pick any language" touches the WHOLE
+  pipeline, not one setting: Whisper's transcribe (`language="en"`
+  hardcoded in both `transcribe()` and `word_timing()`), Kokoro's
+  `lang_code="a"` (American English) and per-language voice sets,
+  TalkingHead's `lipsyncModules: ["en"]`. Real, multi-file scope -- not a
+  quick add.
 
 ## Open questions (waiting on you)
 - **Gmail access** -- you asked for "all the daily used" APIs including

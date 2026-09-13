@@ -3,9 +3,10 @@ console version), wrapped in a proper window with chat history instead of a
 bare terminal. Still fully local -- brain/voice never leave this machine."""
 import streamlit as st
 
-from krishna import (MODEL, SAMPLE_RATE, SYSTEM_PROMPT, _load_tts, _load_whisper,
-                     load_history, maybe_take_note, record_vad, save_history,
-                     speak, synthesize, think, think_and_speak, transcribe, word_timing)
+from krishna import (MODEL, SAMPLE_RATE, SYSTEM_PROMPT, VOICE_OPTIONS, _load_tts,
+                     _load_whisper, load_history, maybe_take_note, record_vad,
+                     save_history, set_voice, speak, synthesize, think,
+                     think_and_speak, transcribe, word_timing)
 import avatar_widget
 
 st.set_page_config(page_title="Krishna", page_icon="\U0001FA94", layout="centered")
@@ -27,6 +28,9 @@ tts = get_tts()
 st.title("Krishna")
 st.caption("Fully local voice companion. Nothing you say leaves this machine — "
            "no Anthropic, no OpenAI, no cloud API of any kind.")
+
+_voice_label = st.selectbox("🔊 Voice", list(VOICE_OPTIONS.keys()), key="voice_choice")
+set_voice(VOICE_OPTIONS[_voice_label])
 
 if "history" not in st.session_state:
     st.session_state.history = load_history()
