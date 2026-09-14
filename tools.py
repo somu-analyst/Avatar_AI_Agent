@@ -9,11 +9,17 @@ Ollama's client auto-converts that into a tool schema (verified: llama3.2:3b
 correctly identifies when to call get_weather and extracts the right
 argument, tested live before this was wired into the main app).
 
-All tools here are read-only public lookups, no API key, no personal data
--- the safe category, same reasoning as the notes feature. News needs a
-Currents API key (not yet provided) so it's a placeholder for now.
+Most tools here are read-only public lookups, no API key, no personal data
+-- the safe category, same reasoning as the notes feature. Stocks need a
+free Finnhub key (checked researching this: no reliable keyless real-time
+stock quote source exists anymore -- Yahoo Finance's unofficial endpoints
+are fragile/rate-limited, matches what job-search-copilot/NYSE_DATA already
+found; Stooq's old keyless CSV endpoint is dead, verified live). News still
+needs a Currents API key (not yet provided) so it's a placeholder for now.
 """
 from __future__ import annotations
+
+import os
 
 import requests
 
@@ -96,7 +102,69 @@ def tell_joke() -> str:
         return f"Joke lookup failed: {e}"
 
 
+def get_stock_price(ticker: str) -> str:
+    """Get the current stock price for a ticker symbol.
+
+    Args:
+        ticker: Stock ticker symbol, e.g. "AAPL" or "TSLA"
+    """
+    api_key = os.environ.get("FINNHUB_API_KEY")
+    if not api_key:
+        return ("Stock lookup isn't set up yet -- needs a free Finnhub API "
+                "key (finnhub.io, no cost, no credit card) set as the "
+                "FINNHUB_API_KEY environment variable.")
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": ticker.upper(), "token": api_key}, timeout=10).json()
+        price = r.get("c")   # current price
+        if not price:
+            return f"Could not find a price for '{ticker}'."
+        change = r.get("d", 0)
+        pct = r.get("dp", 0)
+        direction = "up" if change >= 0 else "down"
+        return (f"{ticker.upper()}: ${price:.2f}, {direction} "
+                f"{abs(change):.2f} ({abs(pct):.2f}%) today.")
+    except Exception as e:
+        return f"Stock lookup failed: {e}"
+
+
+# TheSportsDB's own published free test key ("123") -- genuinely keyless
+# from the user's side, no signup, documented by TheSportsDB itself for
+# exactly this kind of non-commercial use (verified live: real team/event
+# data comes back, not a stub).
+_SPORTSDB_KEY = "123"
+
+
+def get_sports_score(team_name: str) -> str:
+    """Get the most recent game result for a sports team.
+
+    Args:
+        team_name: Team name, e.g. "Los Angeles Lakers" or "Manchester United"
+    """
+    try:
+        search = requests.get(
+            f"https://www.thesportsdb.com/api/v1/json/{_SPORTSDB_KEY}/searchteams.php",
+            params={"t": team_name}, timeout=10).json()
+        teams = search.get("teams") or []
+        if not teams:
+            return f"Could not find a team matching '{team_name}'."
+        team = teams[0]
+        events = requests.get(
+            f"https://www.thesportsdb.com/api/v1/json/{_SPORTSDB_KEY}/eventslast.php",
+            params={"id": team["idTeam"]}, timeout=10).json()
+        results = events.get("results") or []
+        if not results:
+            return f"No recent results found for {team['strTeam']}."
+        e = results[0]
+        return (f"{e['strHomeTeam']} {e['intHomeScore']} - {e['intAwayScore']} "
+                f"{e['strAwayTeam']} ({e['dateEvent']}, {e.get('strLeague', '')})")
+    except Exception as e:
+        return f"Sports lookup failed: {e}"
+
+
 # News needs a free Currents API key (not yet provided) -- listed here as a
 # placeholder so it's visible in ALL_TOOLS rather than silently missing, but
 # not registered as an active tool until a key exists.
-ALL_TOOLS = [get_weather, convert_currency, define_word, tell_joke]
+ALL_TOOLS = [get_weather, convert_currency, define_word, tell_joke,
+             get_stock_price, get_sports_score]

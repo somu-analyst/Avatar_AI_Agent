@@ -74,17 +74,22 @@ Tested Docker-sandboxed Open Interpreter on the Oracle VM (2026-09-12).
 - **Chatterbox TTS** -- installed (verified importable), not yet wired in
   to replace Kokoro. Quality reasoning: blind listening study showed 65.3%
   preferred Chatterbox Turbo over ElevenLabs.
-- **Tool-calling for live data** -- researched and picked, not yet built:
-  Open-Meteo (weather, no key), Frankfurter/Exchangerate.host (currency, no
-  key), Free Dictionary API (no key), Nager.Date (holidays/calendar, no
-  key), JokeAPI (no key), Currents API (news, free signup needed -- you'd
-  need to grab a key). Elaborated: should fire mid-conversation when
-  relevant (news, current events, stocks/live prices, sports, weather) --
-  needs actual LLM tool-calling wired up (the model decides when to reach
-  for a tool), not just standalone functions. Stocks/live-prices/sports
-  need their own source research -- not yet picked (existing job-search-
-  copilot/NYSE_DATA projects have Finnhub etc. for market data, worth
-  checking if that's reusable before finding something new).
+- **Tool-calling for live data** -- weather/currency/dictionary/jokes DONE
+  and live (Open-Meteo, Frankfurter, Free Dictionary API, JokeAPI, all
+  keyless). **Sports DONE, 2026-09-13**: `get_sports_score()` via
+  TheSportsDB's own published free test key ("123") -- genuinely keyless,
+  no signup, verified live (real Lakers/Warriors score came back, not a
+  stub). **Stocks built but needs a key, 2026-09-13**: `get_stock_price()`
+  via Finnhub -- researched first (per your "search git/reddit" standing
+  ask) and confirmed no reliable keyless real-time stock source exists
+  anymore: Stooq's old keyless CSV endpoint is dead (tested live, 404),
+  Yahoo Finance's unofficial endpoints are fragile/rate-limited (matches
+  what job-search-copilot/NYSE_DATA already found). Gracefully explains
+  what's missing rather than crashing if `FINNHUB_API_KEY` isn't set --
+  free signup at finnhub.io, no cost, no credit card, whenever you want
+  live stock prices working.
+  - **Currents API (news)** still needs a key from you, unchanged from
+    before.
 - **Avatar picker** -- choose between multiple avatar faces. Only one
   avatar (brunette.glb) exists right now; needs more correctly-rigged
   avatars (same ARKit+Oculus+Mixamo requirement as before) before a picker
