@@ -159,18 +159,49 @@ def _get_tts_pipeline(tts_cache: dict):
     return tts_cache[kokoro_code]
 
 
+_SILERO = None
+
+
+def _silero_vad():
+    """Silero VAD, loaded once. It's a small neural model rather than
+    webrtcvad's signal heuristics, and it's markedly better at telling
+    speech from room noise/breath -- which is what decides whether you get
+    cut off mid-sentence. Returns None if unavailable so record_vad falls
+    back to webrtcvad rather than failing."""
+    global _SILERO
+    if _SILERO is None:
+        try:
+            from silero_vad import load_silero_vad
+            _SILERO = (load_silero_vad(), True)
+        except Exception as e:
+            print(f"[krishna] Silero VAD unavailable, using webrtcvad: {e}")
+            _SILERO = (None, False)
+    return _SILERO[0]
+
+
 def record_vad(max_seconds: int = 20, silence_ms: int = 900,
-              aggressiveness: int = 2) -> np.ndarray:
-    """Records until it detects you've actually stopped talking (via
-    webrtcvad, the same voice-activity-detection real voice assistants use)
-    instead of a fixed duration -- this was the single biggest source of
-    "not like a real conversation": waiting a fixed N seconds regardless of
-    when you actually finished speaking. Stops after `silence_ms` of quiet
-    following detected speech, or `max_seconds` as a hard cap either way."""
-    vad = webrtcvad.Vad(aggressiveness)
-    frame_ms = 30
-    frame_size = int(SAMPLE_RATE * frame_ms / 1000)
-    silence_frames_needed = max(1, silence_ms // frame_ms)
+              aggressiveness: int = 2, speech_threshold: float = 0.5) -> np.ndarray:
+    """Records until it detects you've actually stopped talking, instead of
+    a fixed duration -- this was the single biggest source of "not like a
+    real conversation": waiting a fixed N seconds regardless of when you
+    actually finished speaking. Stops after `silence_ms` of quiet following
+    detected speech, or `max_seconds` as a hard cap either way.
+
+    Uses Silero VAD when available (a small neural model -- much better at
+    distinguishing speech from background noise and breaths than webrtcvad's
+    signal heuristics, which is what causes being cut off mid-sentence), and
+    falls back to webrtcvad if it can't load. Silero wants 512-sample frames
+    at 16kHz; webrtcvad wants 10/20/30ms -- 512 samples is 32ms, so the
+    fallback re-slices to 30ms rather than handing webrtcvad a frame size it
+    rejects."""
+    model = _silero_vad()
+    frame_size = 512 if model is not None else int(SAMPLE_RATE * 30 / 1000)
+    frame_ms = frame_size * 1000 / SAMPLE_RATE
+    silence_frames_needed = max(1, int(silence_ms / frame_ms))
+    vad = None if model is not None else webrtcvad.Vad(aggressiveness)
+    if model is not None:
+        import torch
+        model.reset_states()
 
     q: queue.Queue = queue.Queue()
 
@@ -190,7 +221,16 @@ def record_vad(max_seconds: int = 20, silence_ms: int = 900,
             except queue.Empty:
                 continue
             frames.append(chunk)
-            is_speech = vad.is_speech(chunk.tobytes(), SAMPLE_RATE)
+            flat = chunk.flatten()
+            if model is not None:
+                if len(flat) != frame_size:
+                    continue
+                with torch.no_grad():
+                    prob = model(torch.from_numpy(
+                        flat.astype(np.float32) / 32768.0), SAMPLE_RATE).item()
+                is_speech = prob >= speech_threshold
+            else:
+                is_speech = vad.is_speech(chunk.tobytes(), SAMPLE_RATE)
             if is_speech:
                 triggered = True
                 silence_count = 0

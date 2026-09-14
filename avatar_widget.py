@@ -124,10 +124,26 @@ def _avatar_config_json() -> str:
     return json.dumps(out)
 
 
-def _container_div(height: int) -> str:
+def _container_div(height: int, with_stop: bool = False) -> str:
+    """The stop button lives INSIDE the iframe on purpose. Streamlit can't
+    interrupt speech on the plain-voice path at all -- there, audio plays
+    server-side through sounddevice and the script is blocked inside that
+    call, so a click can't reach it until playback finishes. With the avatar
+    on, audio plays in the BROWSER (Web Audio API), Python has already
+    returned, and this button calls head.stopSpeaking() directly in JS --
+    no Streamlit round-trip, so it cuts off instantly."""
     background = BACKGROUNDS.get(CURRENT_BACKGROUND, BACKGROUNDS[DEFAULT_BACKGROUND])
-    return (f'<div id="avatar" style="width:100%;height:{height}px;'
-            f'background:{background};border-radius:12px"></div>')
+    stop_btn = ""
+    if with_stop:
+        stop_btn = (
+            '<button id="stopbtn" style="position:absolute;right:12px;top:12px;'
+            'z-index:10;padding:7px 14px;border-radius:8px;border:none;'
+            'background:rgba(255,75,75,.92);color:#fff;font:600 13px system-ui;'
+            'cursor:pointer">&#9632; Stop</button>')
+    return (f'<div style="position:relative">'
+            f'<div id="avatar" style="width:100%;height:{height}px;'
+            f'background:{background};border-radius:12px"></div>'
+            f'{stop_btn}</div>')
 
 
 def _base_script(speak_js: str, sample_rate: int = 24000) -> str:
@@ -150,6 +166,15 @@ def _base_script(speak_js: str, sample_rate: int = 24000) -> str:
     pcmSampleRate: {sample_rate}
   }});
   await head.showAvatar({_avatar_config_json()});
+  const stopBtn = document.getElementById('stopbtn');
+  if (stopBtn) {{
+    stopBtn.addEventListener('click', () => {{
+      head.stopSpeaking();
+      stopBtn.textContent = 'Stopped';
+      stopBtn.disabled = true;
+      stopBtn.style.background = 'rgba(120,120,120,.85)';
+    }});
+  }}
   {speak_js}
 </script>
 """
@@ -178,7 +203,8 @@ def render_speaking(audio_f32: np.ndarray, words: list[str], wtimes: list[int],
         f'    {{}}, () => {{}}\n'
         f'  );'
     )
-    components.html(_container_div(height) + _base_script(speak_js, sample_rate), height=height)
+    components.html(_container_div(height, with_stop=True) + _base_script(speak_js, sample_rate),
+                    height=height + 10)
 
 
 def render_idle(height: int = 420) -> None:
