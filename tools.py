@@ -20,8 +20,29 @@ needs a Currents API key (not yet provided) so it's a placeholder for now.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import requests
+
+_KEYS_PATH = Path(__file__).resolve().parent / "api_keys.env"
+
+
+def _api_key(name: str) -> str | None:
+    """Environment variable first, then a local gitignored api_keys.env
+    (`NAME=value` lines) -- same shape as the NYSE_DATA bot's plaintext key
+    file, so a key can be dropped in without touching code. The file is
+    gitignored on purpose: keys must never reach the repo."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    if _KEYS_PATH.exists():
+        for line in _KEYS_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() == name:
+                    return v.strip().strip('"').strip("'")
+    return None
 
 
 def get_weather(location: str) -> str:
@@ -108,11 +129,11 @@ def get_stock_price(ticker: str) -> str:
     Args:
         ticker: Stock ticker symbol, e.g. "AAPL" or "TSLA"
     """
-    api_key = os.environ.get("FINNHUB_API_KEY")
+    api_key = _api_key("FINNHUB_API_KEY")
     if not api_key:
         return ("Stock lookup isn't set up yet -- needs a free Finnhub API "
-                "key (finnhub.io, no cost, no credit card) set as the "
-                "FINNHUB_API_KEY environment variable.")
+                "key (finnhub.io, no cost, no credit card) in api_keys.env "
+                "or the FINNHUB_API_KEY environment variable.")
     try:
         r = requests.get(
             "https://finnhub.io/api/v1/quote",

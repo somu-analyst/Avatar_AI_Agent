@@ -4,3 +4,4 @@ __pycache__/
 memory.json
 notes.md
 vendor/espeak-ng/
+api_keys.env

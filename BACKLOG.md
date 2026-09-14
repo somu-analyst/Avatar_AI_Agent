@@ -150,22 +150,53 @@ sources, not one path.
   facexlib `ModuleNotFoundError`s as the same root cause, not two bugs.
   Fix given: drop the pins, `pip install` the package names bare so pip
   picks 3.12-compatible wheels. Not yet confirmed working by you.
-- **Kaggle**: built and ran an actual kernel end to end --
-  `srinivasaraosomu/sadtalker-avatar-test` (private). Clones SadTalker,
-  installs `requirements.txt` AS PINNED (Kaggle's Python is older, matches
-  the 2022 pins natively -- no source-build problem here), downloads all
-  checkpoints (~1.7GB, confirmed on disk: both safetensors + both mapping
-  models), runs `inference.py` on the bundled example image/audio. Kernel
-  finished with status COMPLETE, but the run log came back 0 bytes on the
-  first pull -- looked like the same Windows-console UTF-8 encoding crash
-  as the Kokoro TTS bug (tqdm/aria2c progress output has non-ASCII chars),
-  not a Kaggle-side failure. Re-pulling with `PYTHONUTF8=1` /
-  `PYTHONIOENCODING=utf-8` to get the real log and confirm whether
-  `inference.py` actually produced a result video or died partway --
-  **unresolved as of this entry**, no `results/*.mp4` seen in the output
-  yet.
-- **Hugging Face Spaces**: found a working alternative (John6666/SadTalker,
-  confirmed live) -- not yet tried.
+- **Kaggle** -- `srinivasaraosomu/sadtalker-avatar-test` (private), the
+  active path. 8 run iterations; each is ~5 min (clone + install + ~1.7GB
+  checkpoints + preprocessing), which is why one-error-at-a-time patching
+  was the wrong approach here (your call-out, correct). Resolved in order,
+  each a genuinely different root cause, not a repeat:
+  1. **GPU architecture** -- Kaggle assigned a Tesla P100 (sm_60) that its
+     own stock PyTorch no longer ships kernels for. Kaggle staff's own
+     position (GitHub Kaggle/docker-python#1546) is that P100 is being
+     deprecated and they won't restore support -- so the fix is pinning
+     `"machine_shape": "NvidiaTeslaT4"` in kernel-metadata.json rather than
+     letting `enable_gpu` pick. T4 confirmed working (torch 2.10.0+cu128,
+     CUDA matmul verified).
+  2. **basicsr/gfpgan from PyPI** -- the actual original cause of the
+     `egg_info`/metadata-generation failure that cascaded into the bogus
+     "kornia missing"/"facexlib missing" errors. Installing both from their
+     GitHub source instead (copied from the working HF Space's own
+     requirements.txt) fixes it at the root.
+  3. **numpy version whack-a-mole, abandoned as unwinnable** -- SadTalker's
+     source uses several removed numpy aliases with DIFFERENT removal
+     versions (`np.VisibleDeprecationWarning` needs <2.0, `np.float` needs
+     <1.24), and <1.24 has no Python 3.12 wheel at all. No single pin can
+     satisfy it. Replaced version-chasing with monkeypatching the removed
+     aliases back onto numpy before inference runs (via `runpy`), so any
+     modern numpy works.
+  4. **Ragged-array construction** (`trans_params = np.array([w0, h0, s,
+     t[0], t[1]])`) -- old numpy silently made an object array with just a
+     warning; modern numpy makes it a hard ValueError. Patched to
+     `dtype=object` in-place via sed.
+  5. **Proactive pass (rather than waiting for each to crash a run)**: read
+     the full source for other dated-API landmines and pre-fixed two more --
+     `Image.ANTIALIAS` (removed in Pillow 10) → `Image.LANCZOS`, and every
+     `torch.load()` on the real import path → explicit `weights_only=False`
+     (torch 2.6 flipped that default to True, which breaks older
+     checkpoints). Both verified by applying them to a local clone and
+     compiling every patched file.
+  - **Status: v8 COMPLETE, result being checked.** Still no confirmed
+    `results/*.mp4` as of this entry.
+- **Hugging Face Spaces**: John6666/SadTalker confirmed live. Deliberately
+  NOT used for real content -- it's a shared public Space (your photo would
+  go to a third party's infrastructure, against Krishna's local-only
+  principle). Only viable if duplicated privately under your own HF account.
+- **Other free-GPU fallbacks researched** (your redundancy ask): Lightning
+  AI is the best remaining option -- ~22 GPU-hrs/month free, no credit card,
+  and crucially a PERSISTENT environment (installed packages survive between
+  sessions), which would eliminate the reinstall-every-run cost that made
+  this loop slow. Saturn Cloud (T4, free tier) is a simpler third option.
+  SageMaker Studio Lab is closing to new signups -- skip.
 
 ## Open questions (waiting on you)
 - **Gmail access** -- you asked for "all the daily used" APIs including
