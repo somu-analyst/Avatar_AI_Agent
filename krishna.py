@@ -399,6 +399,28 @@ def _mms_synthesize(tts_cache: dict, text: str) -> np.ndarray:
     way (see _get_tts_pipeline for why more than a few live models at once
     corrupts the process)."""
     import torch
+
+    tok, model = _mms_load(tts_cache)
+    inputs = tok(text, return_tensors="pt")
+    # An MMS tokenizer only knows its own script. Feeding Telugu's tokenizer
+    # Latin text yields ZERO tokens and the model then fails with "input
+    # size 0 ... resulted in a negative output size" -- hit live, both from
+    # warming up with the word "ok" and (more importantly) whenever the LLM
+    # answers in English while an Indian language is selected. Skip instead
+    # of crashing: better to go unspoken than to take the reply down.
+    if inputs["input_ids"].shape[-1] == 0:
+        print(f"[krishna] {CURRENT_LANGUAGE} voice can't pronounce "
+              f"{text[:40]!r} (wrong script) -- skipping speech.")
+        return np.array([], dtype=np.float32)
+    with torch.no_grad():
+        wave = model(**inputs).waveform
+    return wave.squeeze().cpu().numpy().astype(np.float32)
+
+
+def _mms_load(tts_cache: dict):
+    """Loads (and caches) the current language's MMS model WITHOUT running
+    inference -- kept separate from _mms_synthesize so warm-up doesn't have
+    to invent a sample string, which is what broke Telugu."""
     from transformers import AutoTokenizer, VitsModel
 
     code = LANGUAGES[CURRENT_LANGUAGE]["mms"]
@@ -408,11 +430,7 @@ def _mms_synthesize(tts_cache: dict, text: str) -> np.ndarray:
         model_id = f"facebook/mms-tts-{code}"
         tts_cache[key] = (AutoTokenizer.from_pretrained(model_id),
                           VitsModel.from_pretrained(model_id))
-    tok, model = tts_cache[key]
-    inputs = tok(text, return_tensors="pt")
-    with torch.no_grad():
-        wave = model(**inputs).waveform
-    return wave.squeeze().cpu().numpy().astype(np.float32)
+    return tts_cache[key]
 
 
 def _safe_tts_chunks(tts_cache: dict, text: str):
@@ -452,7 +470,7 @@ def prepare_voice(tts_cache: dict) -> None:
     inside a reply looks like an unexplained hang, so the UI calls this up
     front where it can show what's happening."""
     if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms":
-        _mms_synthesize(tts_cache, "ok")
+        _mms_load(tts_cache)
 
 
 def current_sample_rate() -> int:

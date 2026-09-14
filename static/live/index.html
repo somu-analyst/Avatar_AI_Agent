@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Krishna Live</title>
+<style>
+  :root {
+    --bg: #11131a; --panel: #181b24; --line: #262b38;
+    --text: #e9ecf3; --dim: #98a1b5; --accent: #ff5a5a; --ok: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, Segoe UI, sans-serif;
+    display: flex; justify-content: center; padding: 24px 16px;
+  }
+  .wrap { width: 100%; max-width: 760px; }
+  h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: -.01em; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+  .bar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px; margin-bottom: 14px;
+  }
+  button {
+    font: 600 14px system-ui; padding: 9px 16px; border-radius: 9px;
+    border: 1px solid var(--line); background: #232838; color: var(--text);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  select {
+    font: 14px system-ui; padding: 8px 10px; border-radius: 9px;
+    background: #232838; color: var(--text); border: 1px solid var(--line);
+  }
+  #status { color: var(--dim); font-size: 13px; margin-left: auto; }
+  #level {
+    height: 6px; border-radius: 3px; background: #232838;
+    overflow: hidden; margin-bottom: 14px;
+  }
+  #level > div { height: 100%; width: 0; background: var(--ok); transition: width .07s; }
+  #log {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px; min-height: 280px;
+  }
+  .msg { margin-bottom: 12px; }
+  .who { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); }
+  .you .who { color: #7dd3fc; }
+  .note { color: var(--dim); font-size: 13px; font-style: italic; }
+  .tag {
+    display: inline-block; font-size: 11px; padding: 2px 8px;
+    border-radius: 20px; background: #2a3145; color: var(--dim);
+  }
+  .tag.live { background: #143a22; color: var(--ok); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Krishna Live</h1>
+  <div class="sub">
+    Real barge-in — just start talking and it stops mid-sentence. Nothing
+    leaves this machine.
+  </div>
+
+  <div class="bar">
+    <button id="start" class="primary">Start listening</button>
+    <button id="stop" disabled>Stop speaking</button>
+    <select id="lang"></select>
+    <span id="status">not connected</span>
+  </div>
+  <div id="level"><div id="levelbar"></div></div>
+  <div id="log"></div>
+</div>
+
+<script>
+const SR = 16000, FRAME = 512;
+let ws, ctx, micStream, node, playing = false, queue = [], playSR = 24000;
+let nextStart = 0, sources = [];
+
+const $ = id => document.getElementById(id);
+const setStatus = t => $("status").textContent = t;
+
+function add(who, text, cls) {
+  const d = document.createElement("div");
+  d.className = "msg " + (cls || "");
+  d.innerHTML = `<div class="who">${who}</div><div>${text}</div>`;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+// Float32 mic audio at the device rate -> Int16 at 16kHz, which is what
+// Silero and Whisper both expect on the server side.
+function downsample(buf, inRate) {
+  if (inRate === SR) return buf;
+  const ratio = inRate / SR;
+  const out = new Float32Array(Math.round(buf.length / ratio));
+  for (let i = 0; i < out.length; i++) out[i] = buf[Math.floor(i * ratio)] || 0;
+  return out;
+}
+
+function toInt16(f32) {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    out[i] = s * 32767;
+  }
+  return out;
+}
+
+function stopPlayback() {
+  sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  sources = [];
+  queue = [];
+  nextStart = 0;
+  playing = false;
+  $("stop").disabled = true;
+}
+
+// Each chunk is scheduled immediately after the previous one so sentences
+// run together without gaps, while still being individually stoppable.
+function playPCM(int16) {
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+  const buf = ctx.createBuffer(1, f32.length, playSR);
+  buf.copyToChannel(f32, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const now = ctx.currentTime;
+  const at = Math.max(now, nextStart || now);
+  src.start(at);
+  nextStart = at + buf.duration;
+  sources.push(src);
+  src.onended = () => { sources = sources.filter(s => s !== src); };
+}
+
+async function start() {
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => { setStatus("listening"); $("start").disabled = true; };
+  ws.onclose = () => setStatus("disconnected");
+
+  ws.onmessage = ev => {
+    if (ev.data instanceof ArrayBuffer) { playPCM(new Int16Array(ev.data)); return; }
+    const m = JSON.parse(ev.data);
+    if (m.type === "ready") {
+      const sel = $("lang");
+      sel.innerHTML = "";
+      m.languages.forEach(l => {
+        const o = document.createElement("option");
+        o.value = o.textContent = l;
+        if (l === m.language) o.selected = true;
+        sel.appendChild(o);
+      });
+    } else if (m.type === "user") {
+      add("you", m.text, "you");
+    } else if (m.type === "assistant") {
+      add("krishna", m.text);
+    } else if (m.type === "status") {
+      setStatus(m.text);
+    } else if (m.type === "speaking_start") {
+      playSR = m.sample_rate || 24000;
+      playing = true; nextStart = 0;
+      $("stop").disabled = false;
+      setStatus("speaking — just talk to interrupt");
+    } else if (m.type === "speaking_end") {
+      playing = false; $("stop").disabled = true; setStatus("listening");
+    } else if (m.type === "stop") {
+      stopPlayback();
+      setStatus(m.reason === "barge-in" ? "you interrupted — listening" : "stopped");
+    } else if (m.type === "error") {
+      add("error", m.text, "note");
+    }
+  };
+
+  const src = ctx.createMediaStreamSource(micStream);
+  node = ctx.createScriptProcessor(2048, 1, 1);
+  let pending = new Int16Array(0);
+
+  node.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < input.length; i++) peak = Math.max(peak, Math.abs(input[i]));
+    $("levelbar").style.width = Math.min(100, peak * 240) + "%";
+
+    if (!ws || ws.readyState !== 1) return;
+    const i16 = toInt16(downsample(input, ctx.sampleRate));
+    const merged = new Int16Array(pending.length + i16.length);
+    merged.set(pending); merged.set(i16, pending.length);
+    const full = Math.floor(merged.length / FRAME) * FRAME;
+    if (full > 0) ws.send(merged.slice(0, full).buffer);
+    pending = merged.slice(full);
+  };
+
+  src.connect(node);
+  node.connect(ctx.destination);
+}
+
+$("start").onclick = () => start().catch(e => {
+  setStatus("mic error: " + e.message);
+});
+$("stop").onclick = () => {
+  stopPlayback();
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
+};
+$("lang").onchange = e => {
+  if (ws && ws.readyState === 1)
+    ws.send(JSON.stringify({ type: "set_language", language: e.target.value }));
+};
+</script>
+</body>
+</html>
