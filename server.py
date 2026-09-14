@@ -29,7 +29,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 from pathlib import Path
+
+# Kokoro's G2P reads a data file without declaring an encoding, so on Windows
+# Python defaults to cp1252 and it dies with "'charmap' codec can't decode
+# byte 0x9d". That kills EVERY sentence -- silently, because TTS failures are
+# caught so a bad reply goes unspoken rather than crashing the app. The result
+# looks exactly like Krishna ignoring you: text reply appears, no audio.
+# PYTHONUTF8 has to be set before the interpreter starts to take effect, so
+# re-exec once with it rather than trusting whoever launched us to know this.
+if os.environ.get("PYTHONUTF8") != "1":
+    os.environ["PYTHONUTF8"] = "1"
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 import numpy as np
 import torch
