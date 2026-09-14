@@ -53,7 +53,16 @@
     border-radius: 20px; background: #2a3145; color: var(--dim);
   }
   .tag.live { background: #143a22; color: var(--ok); }
+  .chk { display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--dim); }
+  .chk input { width: 16px; height: 16px; accent-color: var(--accent); }
+  #avatarBox { height: 400px; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
 </style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -67,16 +76,57 @@
     <button id="start" class="primary">Start listening</button>
     <button id="stop" disabled>Stop speaking</button>
     <select id="lang"></select>
+    <label class="chk"><input type="checkbox" id="avatarOn"> Avatar</label>
     <span id="status">not connected</span>
   </div>
+  <div class="bar" id="avatarBar" style="display:none">
+    <select id="face"></select>
+    <select id="bg"></select>
+    <span class="tag">mounted once — no reload between replies</span>
+  </div>
   <div id="level"><div id="levelbar"></div></div>
+  <div id="avatarBox" style="display:none"></div>
   <div id="log"></div>
 </div>
 
-<script>
+<script type="module">
 const SR = 16000, FRAME = 512;
 let ws, ctx, micStream, node, playing = false, queue = [], playSR = 24000;
 let nextStart = 0, sources = [];
+let head = null, pendingTiming = null;
+
+// Same avatar set and per-avatar corrections as the Streamlit app -- the
+// retarget/baseline values are upstream's own, and AvatarSDK sits visibly
+// wrong without its neck/shoulder fix.
+const AVATARS = {
+  "Brunette (Ready Player Me)": { file: "brunette.glb", body: "F", avatarMood: "neutral" },
+  "Avaturn (realistic, from photo)": {
+    file: "avaturn.glb", body: "F", avatarMood: "happy",
+    retarget: { Hips:{y:0.03}, Spine:{y:0.02}, Spine1:{y:0.02,z:0.01},
+      Spine2:{y:0.02,z:0.01}, Neck:{z:0.02,y:0.01}, Head:{z:0.02},
+      LeftShoulder:{rx:-0.5}, RightShoulder:{rx:-0.5}, scaleToHipsLevel:1.0 },
+    baseline: { headRotateX:-0.05, eyeBlinkLeft:0.15, eyeBlinkRight:0.15 }
+  },
+  "AvatarSDK (realistic, male)": {
+    file: "avatarsdk.glb", body: "M", avatarMood: "neutral",
+    retarget: { Neck:{z:-0.01,rx:-0.15}, Neck1:{z:-0.01,rx:-0.15},
+      Neck2:{z:-0.01,rx:-0.15}, LeftShoulder:{rz:-0.3}, RightShoulder:{rz:0.3},
+      scaleToEyesLevel:1.0, origin:{y:-0.1} },
+    baseline: { headRotateX:-0.04, eyeBlinkLeft:0.05, eyeBlinkRight:0.05 }
+  },
+  "VRoid (anime style)": {
+    file: "vroid.glb", body: "F", avatarMood: "neutral",
+    baseline: { headRotateX:-0.1, eyeBlinkLeft:0.05, eyeBlinkRight:0.05 }
+  },
+  "Brunette (alternate build)": { file: "brunette-t.glb", body: "F", avatarMood: "neutral" }
+};
+const BACKGROUNDS = {
+  "Charcoal": "#1a1a1a", "Slate": "#2b3137",
+  "Deep blue": "linear-gradient(160deg,#0f2027,#203a43,#2c5364)",
+  "Warm grey": "#3a3532", "Studio purple": "linear-gradient(160deg,#2b1055,#44318d)",
+  "Forest": "linear-gradient(160deg,#0b3d2c,#1d6f4d)",
+  "Sunset": "linear-gradient(160deg,#3a1c71,#d76d77,#ffaf7b)", "Plain white": "#f2f2f2"
+};
 
 const $ = id => document.getElementById(id);
 const setStatus = t => $("status").textContent = t;
@@ -149,7 +199,21 @@ async function start() {
   ws.onclose = () => setStatus("disconnected");
 
   ws.onmessage = ev => {
-    if (ev.data instanceof ArrayBuffer) { playPCM(new Int16Array(ev.data)); return; }
+    if (ev.data instanceof ArrayBuffer) {
+      const pcm = new Int16Array(ev.data);
+      if (head && $("avatarOn").checked && pendingTiming) {
+        // speakAudio wants a real Array of ArrayBuffers holding int16 PCM --
+        // its Array.isArray() check is what decides whether PCM conversion
+        // runs at all (learned the hard way in the Streamlit version).
+        head.speakAudio({ audio: [pcm.buffer], words: pendingTiming.words,
+                          wtimes: pendingTiming.wtimes,
+                          wdurations: pendingTiming.wdurations }, {}, () => {});
+        pendingTiming = null;
+      } else {
+        playPCM(pcm);
+      }
+      return;
+    }
     const m = JSON.parse(ev.data);
     if (m.type === "ready") {
       const sel = $("lang");
@@ -173,8 +237,12 @@ async function start() {
       setStatus("speaking — just talk to interrupt");
     } else if (m.type === "speaking_end") {
       playing = false; $("stop").disabled = true; setStatus("listening");
+    } else if (m.type === "chunk_timing") {
+      pendingTiming = m;
     } else if (m.type === "stop") {
       stopPlayback();
+      if (head) { try { head.stopSpeaking(); } catch (e) {} }
+      pendingTiming = null;
       setStatus(m.reason === "barge-in" ? "you interrupted — listening" : "stopped");
     } else if (m.type === "error") {
       add("error", m.text, "note");
@@ -211,6 +279,50 @@ $("stop").onclick = () => {
   stopPlayback();
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
 };
+async function mountAvatar() {
+  const { TalkingHead } = await import("/static/avatar/talkinghead.mjs");
+  const box = $("avatarBox");
+  box.style.display = "block";
+  if (head) return;
+  head = new TalkingHead(box, {
+    ttsEndpoint: "", lipsyncModules: ["en"],
+    cameraView: "upper", pcmSampleRate: playSR
+  });
+  await applyFace();
+}
+
+async function applyFace() {
+  if (!head) return;
+  const cfg = AVATARS[$("face").value];
+  await head.showAvatar({
+    url: "/static/avatar/avatars/" + cfg.file,
+    body: cfg.body, avatarMood: cfg.avatarMood, lipsyncLang: "en",
+    ...(cfg.retarget ? { retarget: cfg.retarget } : {}),
+    ...(cfg.baseline ? { baseline: cfg.baseline } : {})
+  });
+}
+
+Object.keys(AVATARS).forEach(n => {
+  const o = document.createElement("option"); o.value = o.textContent = n;
+  $("face").appendChild(o);
+});
+Object.keys(BACKGROUNDS).forEach(n => {
+  const o = document.createElement("option"); o.value = o.textContent = n;
+  $("bg").appendChild(o);
+});
+$("avatarBox").style.background = BACKGROUNDS["Charcoal"];
+
+$("avatarOn").onchange = async e => {
+  const on = e.target.checked;
+  $("avatarBar").style.display = on ? "flex" : "none";
+  $("avatarBox").style.display = on ? "block" : "none";
+  if (ws && ws.readyState === 1)
+    ws.send(JSON.stringify({ type: "set_avatar", on }));
+  if (on) { try { await mountAvatar(); } catch (err) { setStatus("avatar error: " + err.message); } }
+};
+$("face").onchange = () => applyFace();
+$("bg").onchange = e => { $("avatarBox").style.background = BACKGROUNDS[e.target.value]; };
+
 $("lang").onchange = e => {
   if (ws && ws.readyState === 1)
     ws.send(JSON.stringify({ type: "set_language", language: e.target.value }));

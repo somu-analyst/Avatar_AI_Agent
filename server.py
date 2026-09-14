@@ -36,6 +36,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 import krishna as k
 
@@ -59,6 +60,11 @@ def _load_models() -> None:
         _models["history"] = k.load_history()
 
 
+# Serves the TalkingHead library and avatar GLBs to the live page, the same
+# assets the Streamlit app serves through its own static route.
+app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+
+
 @app.get("/")
 async def index():
     return FileResponse(STATIC / "index.html")
@@ -76,6 +82,7 @@ class Session:
         self.silence_frames = 0
         self.triggered = False
         self.speaking = False          # is the browser currently playing audio
+        self.avatar = False            # browser has the avatar view enabled
         self.task: asyncio.Task | None = None
         self.vad = _models["vad"]
         self.vad.reset_states()
@@ -177,6 +184,14 @@ class Session:
                     None, k.synthesize, _models["tts"], sentence)
                 if audio is None or not len(audio):
                     continue
+                # Word timings ride ahead of each chunk so the avatar can
+                # lip-sync it. Only computed when the avatar is actually on:
+                # it's a Whisper pass over Krishna's own speech (~0.15s per
+                # sentence, measured), pure waste with the avatar off.
+                if self.avatar:
+                    timing = await loop.run_in_executor(
+                        None, k.word_timing, _models["whisper"], audio)
+                    await self.send({"type": "chunk_timing", **timing})
                 pcm = (np.clip(k._apply_volume(audio), -1, 1) * 32767).astype("<i2")
                 await self.ws.send_bytes(pcm.tobytes())
         except asyncio.CancelledError:
@@ -198,6 +213,11 @@ async def ws_endpoint(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive()
+            # receive() RETURNS a disconnect message rather than raising, and
+            # calling it again afterwards throws RuntimeError -- which killed
+            # the session loop on every page reload. Handle it explicitly.
+            if msg.get("type") == "websocket.disconnect":
+                break
             if "bytes" in msg and msg["bytes"] is not None:
                 data = np.frombuffer(msg["bytes"], dtype="<i2")
                 for i in range(0, len(data) - FRAME + 1, FRAME):
@@ -208,6 +228,8 @@ async def ws_endpoint(ws: WebSocket):
                     k.set_language(payload["language"])
                     await session.send({"type": "status",
                                         "text": f"language: {payload['language']}"})
+                elif payload.get("type") == "set_avatar":
+                    session.avatar = bool(payload.get("on"))
                 elif payload.get("type") == "stop":
                     await session.cancel_reply("user-stop")
     except WebSocketDisconnect:

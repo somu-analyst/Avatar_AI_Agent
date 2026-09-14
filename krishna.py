@@ -244,9 +244,43 @@ def record_vad(max_seconds: int = 20, silence_ms: int = 900,
     return (audio_i16.astype(np.float32) / 32768.0)
 
 
+# Whisper's language code -> our LANGUAGES key, for auto-detect. Only the
+# languages we can actually SPEAK back are listed: detecting something we
+# have no voice for would switch Krishna mute, which is worse than
+# answering in the language it was already set to.
+_WHISPER_TO_LANGUAGE = {
+    "en": "English (US)", "fr": "French", "es": "Spanish", "it": "Italian",
+    "pt": "Portuguese (Brazil)", "hi": "Hindi", "te": "Telugu", "ta": "Tamil",
+    "kn": "Kannada", "ml": "Malayalam", "mr": "Marathi", "bn": "Bengali",
+    "gu": "Gujarati", "pa": "Punjabi", "or": "Odia", "as": "Assamese",
+}
+
+AUTO_LANGUAGE = True
+
+
+def set_auto_language(on: bool) -> None:
+    global AUTO_LANGUAGE
+    AUTO_LANGUAGE = bool(on)
+
+
 def transcribe(whisper_model: WhisperModel, audio: np.ndarray) -> str:
+    """With AUTO_LANGUAGE on (the default), Whisper is given no language and
+    detects it from the audio itself -- so you can switch between English,
+    Hindi and Telugu mid-conversation without touching a setting, and
+    Krishna answers in the language you just used. Detection needs enough
+    audio to be reliable, so very short clips keep the current language
+    rather than acting on a coin-flip guess."""
     if len(audio) < SAMPLE_RATE * 0.3:   # too short to be real speech
         return ""
+    if AUTO_LANGUAGE and len(audio) >= SAMPLE_RATE * 1.0:
+        segments, info = whisper_model.transcribe(audio, language=None)
+        detected = _WHISPER_TO_LANGUAGE.get(getattr(info, "language", None))
+        if (detected and detected != CURRENT_LANGUAGE
+                and getattr(info, "language_probability", 0) >= 0.6):
+            print(f"[krishna] heard {detected} "
+                  f"({info.language_probability:.0%}) -- switching")
+            set_language(detected)
+        return " ".join(s.text.strip() for s in segments).strip()
     segments, _ = whisper_model.transcribe(
         audio, language=LANGUAGES[CURRENT_LANGUAGE]["whisper"])
     return " ".join(s.text.strip() for s in segments).strip()
@@ -417,6 +451,27 @@ def _mms_synthesize(tts_cache: dict, text: str) -> np.ndarray:
     return wave.squeeze().cpu().numpy().astype(np.float32)
 
 
+def _is_native_script(text: str) -> bool:
+    """Does this text contain characters the current MMS voice can actually
+    pronounce? Checked by Unicode block rather than by tokenizing, so the
+    decision happens before the model is even loaded."""
+    ranges = _SCRIPT_RANGES.get(LANGUAGES[CURRENT_LANGUAGE].get("mms"))
+    if not ranges:
+        return True
+    return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in text)
+
+
+# Unicode blocks per MMS language, for the check above.
+_SCRIPT_RANGES = {
+    "tel": [(0x0C00, 0x0C7F)],   "tam": [(0x0B80, 0x0BFF)],
+    "kan": [(0x0C80, 0x0CFF)],   "mal": [(0x0D00, 0x0D7F)],
+    "ben": [(0x0980, 0x09FF)],   "guj": [(0x0A80, 0x0AFF)],
+    "pan": [(0x0A00, 0x0A7F)],   "ory": [(0x0B00, 0x0B7F)],
+    "asm": [(0x0980, 0x09FF)],
+    "hin": [(0x0900, 0x097F)],   "mar": [(0x0900, 0x097F)],
+}
+
+
 def _mms_load(tts_cache: dict):
     """Loads (and caches) the current language's MMS model WITHOUT running
     inference -- kept separate from _mms_synthesize so warm-up doesn't have
@@ -441,6 +496,21 @@ def _safe_tts_chunks(tts_cache: dict, text: str):
     yields nothing rather than crashing, so a bad reply just goes unspoken
     instead of taking the app down."""
     lang = LANGUAGES[CURRENT_LANGUAGE]
+    if lang.get("engine") == "mms" and not _is_native_script(text):
+        # The selected voice can't pronounce this script -- most often
+        # because auto-detect switched to Telugu/Hindi and the model then
+        # answered in English. Falling back to the English voice means you
+        # still HEAR the reply; going mute (the old behaviour) just looks
+        # like Krishna ignored you.
+        print(f"[krishna] {CURRENT_LANGUAGE} voice can't pronounce this "
+              f"script -- speaking it in English instead.")
+        previous = CURRENT_LANGUAGE
+        try:
+            set_language("English (US)")
+            yield from _safe_tts_chunks(tts_cache, text)
+        finally:
+            set_language(previous)
+        return
     if lang.get("engine") == "mms":
         # Deliberately NOT sanitized: _sanitize_for_tts strips everything
         # outside ASCII, which would erase Telugu/Hindi/Tamil text entirely.
