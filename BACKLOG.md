@@ -224,6 +224,16 @@ sources, not one path.
   still waiting on which matters more.
 
 ## Backlog (not being built now)
+- **Separate Finnhub key for Krishna** -- right now Krishna reuses the
+  NYSE_DATA trading bot's key (your call, 2026-09-13: "later we can change
+  the API key"). Both projects therefore share ONE free-tier rate limit
+  (60 calls/min). Harmless at Krishna's usage -- a handful of quote lookups
+  in conversation -- but if the bot ever gets busy enough to approach that
+  ceiling, Krishna's lookups would start failing and, worse, Krishna could
+  contribute to throttling the bot, which has real money riding on it.
+  Fix when wanted: free second signup at finnhub.io, then replace the one
+  line in `krishna/api_keys.env` -- no code change, that file is already
+  the only place the key lives (gitignored).
 - **Open Interpreter on the laptop instead of the VM** -- 6 cores vs the
   VM's 2, likely fast enough. Would need its own sandboxing (Docker Desktop
   on Windows) since it'd be running where your real files live.
