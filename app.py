@@ -3,9 +3,10 @@ console version), wrapped in a proper window with chat history instead of a
 bare terminal. Still fully local -- brain/voice never leave this machine."""
 import streamlit as st
 
-from krishna import (MODEL, SAMPLE_RATE, SYSTEM_PROMPT, VOICE_OPTIONS, _load_tts,
-                     _load_whisper, load_history, maybe_take_note, record_vad,
-                     save_history, set_voice, speak, synthesize, think,
+from krishna import (AVATAR_CAPABLE_LANGUAGES, DEFAULT_LANGUAGE, LANGUAGES, MODEL,
+                     SAMPLE_RATE, SYSTEM_PROMPT, _load_tts, _load_whisper,
+                     load_history, maybe_take_note, record_vad, save_history,
+                     set_language, set_voice, speak, synthesize, think,
                      think_and_speak, transcribe, word_timing)
 import avatar_widget
 
@@ -29,8 +30,27 @@ st.title("Krishna")
 st.caption("Fully local voice companion. Nothing you say leaves this machine — "
            "no Anthropic, no OpenAI, no cloud API of any kind.")
 
-_voice_label = st.selectbox("🔊 Voice", list(VOICE_OPTIONS.keys()), key="voice_choice")
-set_voice(VOICE_OPTIONS[_voice_label])
+_lang_col, _voice_col = st.columns([1, 1])
+with _lang_col:
+    _lang = st.selectbox("🌐 Language", list(LANGUAGES.keys()),
+                         index=list(LANGUAGES.keys()).index(DEFAULT_LANGUAGE),
+                         key="language_choice")
+set_language(_lang)
+with _voice_col:
+    # Keyed by language so switching language always shows THAT language's
+    # voices from their default (first) option, instead of Streamlit
+    # reusing a stale voice_choice value that may not exist in the new
+    # language's voice set at all.
+    _voice_options = LANGUAGES[_lang]["voices"]
+    _voice_label = st.selectbox("🔊 Voice", list(_voice_options.keys()),
+                                key=f"voice_choice_{_lang}")
+set_voice(_voice_options[_voice_label])
+
+if _lang not in AVATAR_CAPABLE_LANGUAGES:
+    st.caption("🧑 Avatar isn't available in this language yet — TalkingHead's "
+              "lip-sync only has real mouth-shape data for English and French; "
+              "every other language still speaks normally, just without the "
+              "avatar view.")
 
 if "history" not in st.session_state:
     st.session_state.history = load_history()
@@ -78,10 +98,14 @@ with c1:
     talk = st.button("🎤 Push to talk (stops on its own once you go quiet)",
                      width='stretch', type="primary")
 with c2:
-    st.toggle("🧑 Avatar", key="avatar_on",
-             help="Shows a talking-head avatar instead of just playing audio. "
-                  "Reloads each reply (brief flicker) -- no persistent "
-                  "avatar yet, that needs a proper custom component.")
+    if _lang in AVATAR_CAPABLE_LANGUAGES:
+        st.toggle("🧑 Avatar", key="avatar_on",
+                 help="Shows a talking-head avatar instead of just playing audio. "
+                      "Reloads each reply (brief flicker) -- no persistent "
+                      "avatar yet, that needs a proper custom component.")
+    else:
+        st.session_state["avatar_on"] = False   # language changed away from
+                                                 # English/French mid-session
 with c3:
     if st.button("🗑 Clear", width='stretch'):
         st.session_state.history = [{"role": "system", "content": SYSTEM_PROMPT}]

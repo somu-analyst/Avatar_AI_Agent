@@ -27,6 +27,25 @@ from faster_whisper import WhisperModel
 
 import tools as _tools
 
+ROOT = Path(__file__).resolve().parent
+
+# Kokoro's non-English voices need espeak-ng for phonemization (English has
+# its own built-in fallback G2P, which is why the English-only version of
+# this project never needed this). misaki (Kokoro's G2P layer) only checks
+# the standard admin-install path (C:\Program Files\eSpeak NG\...), which
+# needs an elevated installer we deliberately avoided -- espeak-ng was
+# extracted instead via `msiexec /a` (an unelevated "administrative install"
+# that just unpacks files) into vendor/espeak-ng/. Setting the library AND
+# data path directly here, before `kokoro` is ever imported, makes
+# phonemizer use this copy instead of misaki's hardcoded (and here, absent)
+# path -- calling misaki's own lookup with the wrong path caused a native
+# access violation, not just a graceful "not found".
+_ESPEAK_DIR = ROOT / "vendor" / "espeak-ng"
+if (_ESPEAK_DIR / "libespeak-ng.dll").exists():
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+    EspeakWrapper.set_library(str(_ESPEAK_DIR / "libespeak-ng.dll"))
+    EspeakWrapper.set_data_path(str(_ESPEAK_DIR / "espeak-ng-data"))
+
 MODEL = "llama3.2:3b"
 SAMPLE_RATE = 16000
 # Ollama unloads an idle model by default, which is exactly why the first
@@ -34,7 +53,6 @@ SAMPLE_RATE = 16000
 # resident in memory for the length of an active conversation.
 KEEP_ALIVE = "30m"
 
-ROOT = Path(__file__).resolve().parent
 MEMORY_PATH = ROOT / "memory.json"
 NOTES_PATH = ROOT / "notes.md"
 MAX_HISTORY_TURNS = 40   # trimmed so an old conversation can't grow the prompt forever
@@ -101,14 +119,44 @@ def maybe_take_note(text: str) -> str | None:
 
 
 def _load_whisper() -> WhisperModel:
+    """'base' (multilingual), not 'base.en' -- the .en variant is English-
+    only at the model level, no language switch could ever make it
+    transcribe anything else. Trades a small amount of English-specific
+    accuracy (base.en edges out base on English alone) for actually
+    supporting every other LANGUAGES entry below."""
     print("[krishna] loading speech recognition (first run downloads the model)...")
-    return WhisperModel("base.en", device="cpu", compute_type="int8")
+    return WhisperModel("base", device="cpu", compute_type="int8")
 
 
-def _load_tts():
+def _load_tts() -> dict:
+    """Returns an empty pipeline CACHE, not a pipeline -- Kokoro's KPipeline
+    is bound to one lang_code at construction (its G2P is language-specific),
+    so supporting multiple languages means multiple pipeline objects, built
+    lazily by _get_tts_pipeline() as each language is actually used, not one
+    upfront load. Every call site below (synthesize/speak/etc.) takes this
+    cache dict in the same argument position the single pipeline used to
+    occupy."""
+    print("[krishna] voice ready (each language's model loads on first use)...")
+    return {}
+
+
+def _get_tts_pipeline(tts_cache: dict):
+    """Deliberately keeps at most ONE Kokoro pipeline alive at a time, not a
+    real per-language cache -- verified live that holding ~5 simultaneous
+    KPipeline instances in one process corrupts it (a trivially small
+    allocation, e.g. 256KB, starts failing with "not enough memory", which
+    is a native-state corruption symptom, not an actual memory shortage;
+    each language up to the 4th worked fine, the 5th broke the process).
+    Evicting every other language's pipeline before building a new one costs
+    a few seconds to reload if you switch back to a language used earlier
+    in the session -- a real but minor cost, worth paying to not risk a
+    crash after a user picks a 5th language."""
     from kokoro import KPipeline
-    print("[krishna] loading voice (first run downloads the model)...")
-    return KPipeline(lang_code="a")   # 'a' = American English
+    kokoro_code = LANGUAGES[CURRENT_LANGUAGE]["kokoro"]
+    if kokoro_code not in tts_cache:
+        tts_cache.clear()
+        tts_cache[kokoro_code] = KPipeline(lang_code=kokoro_code)
+    return tts_cache[kokoro_code]
 
 
 def record_vad(max_seconds: int = 20, silence_ms: int = 900,
@@ -159,7 +207,8 @@ def record_vad(max_seconds: int = 20, silence_ms: int = 900,
 def transcribe(whisper_model: WhisperModel, audio: np.ndarray) -> str:
     if len(audio) < SAMPLE_RATE * 0.3:   # too short to be real speech
         return ""
-    segments, _ = whisper_model.transcribe(audio, language="en")
+    segments, _ = whisper_model.transcribe(
+        audio, language=LANGUAGES[CURRENT_LANGUAGE]["whisper"])
     return " ".join(s.text.strip() for s in segments).strip()
 
 
@@ -174,21 +223,87 @@ def _sanitize_for_tts(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-# Kokoro ships ~54 built-in voices; this is a curated, verified-real subset
-# (naming convention: a=American/b=British, f=female/m=male) rather than the
-# full list -- single-user local app, so a module-level "current voice" is
-# simpler than threading a parameter through every call site (synthesize,
-# speak, speak_interruptible, think_and_speak all funnel through here).
-VOICE_OPTIONS = {
-    "Heart (US female, default)": "af_heart",
-    "Bella (US female)": "af_bella",
-    "Nicole (US female)": "af_nicole",
-    "Adam (US male)": "am_adam",
-    "Michael (US male)": "am_michael",
-    "Emma (British female)": "bf_emma",
-    "George (British male)": "bm_george",
+# Each language: Whisper's language code, Kokoro's lang_code (a pipeline is
+# built per lang_code, not per voice), and a curated set of REAL Kokoro voice
+# IDs -- checked against the actual hexgrad/Kokoro-82M voices/ listing on
+# Hugging Face, same "verified real, not assumed from a naming convention"
+# bar as the original English-only picker.
+LANGUAGES: dict[str, dict] = {
+    "English (US)": {
+        "whisper": "en", "kokoro": "a",
+        "voices": {
+            "Heart (US female, default)": "af_heart",
+            "Bella (US female)": "af_bella",
+            "Nicole (US female)": "af_nicole",
+            "Adam (US male)": "am_adam",
+            "Michael (US male)": "am_michael",
+        },
+    },
+    "English (UK)": {
+        "whisper": "en", "kokoro": "b",
+        "voices": {
+            "Emma (British female)": "bf_emma",
+            "George (British male)": "bm_george",
+        },
+    },
+    "Spanish": {
+        "whisper": "es", "kokoro": "e",
+        "voices": {"Dora (female)": "ef_dora", "Alex (male)": "em_alex"},
+    },
+    "French": {
+        "whisper": "fr", "kokoro": "f",
+        "voices": {"Siwis (female)": "ff_siwis"},
+    },
+    "Hindi": {
+        "whisper": "hi", "kokoro": "h",
+        "voices": {
+            "Alpha (female)": "hf_alpha", "Beta (female)": "hf_beta",
+            "Omega (male)": "hm_omega", "Psi (male)": "hm_psi",
+        },
+    },
+    "Italian": {
+        "whisper": "it", "kokoro": "i",
+        "voices": {"Sara (female)": "if_sara", "Nicola (male)": "im_nicola"},
+    },
+    "Portuguese (Brazil)": {
+        "whisper": "pt", "kokoro": "p",
+        "voices": {"Dora (female)": "pf_dora", "Alex (male)": "pm_alex"},
+    },
+    # Japanese ('j') and Mandarin ('z') deliberately left out -- verified
+    # live that our installed kokoro==0.2.2 (many releases behind latest
+    # 0.7.16) never had these in its own LANG_CODES map at all, so no
+    # env/extra-package fix helps; Japanese's own extra (misaki[ja]) also
+    # needs compiling mojimoji from source, which needs Microsoft's C++
+    # Build Tools (a real, multi-GB system install) we don't have. Real fix
+    # is upgrading kokoro itself, a ~15-minor-version jump that deserves its
+    # own tested pass rather than a blind upgrade risking the already-
+    # verified English/avatar path -- see BACKLOG.md.
 }
-CURRENT_VOICE = "af_heart"
+
+# TalkingHead's own lip-sync viseme modules (checked against the real repo:
+# modules/lipsync-{de,en,fi,fr,lt}.mjs) only exist for these languages of
+# the ones above -- every other language can still speak fine through
+# Kokoro, it just can't drive the avatar's mouth shapes correctly. The UI
+# hides the avatar toggle outside this set rather than showing a mismatched
+# mouth (2026-09-13 decision: voice-only for the rest, not approximate
+# lip-sync).
+AVATAR_CAPABLE_LANGUAGES = {"English (US)", "English (UK)", "French"}
+
+DEFAULT_LANGUAGE = "English (US)"
+CURRENT_LANGUAGE = DEFAULT_LANGUAGE
+CURRENT_VOICE = next(iter(LANGUAGES[DEFAULT_LANGUAGE]["voices"].values()))
+
+
+def set_language(name: str) -> None:
+    """Switches language AND resets the voice to that language's first
+    voice -- a voice ID is only valid inside its own language's Kokoro
+    pipeline, so leaving the old voice selected after a language switch
+    would silently point at the wrong pipeline's voice set."""
+    global CURRENT_LANGUAGE, CURRENT_VOICE
+    if name not in LANGUAGES:
+        return
+    CURRENT_LANGUAGE = name
+    CURRENT_VOICE = next(iter(LANGUAGES[name]["voices"].values()))
 
 
 def set_voice(voice_id: str) -> None:
@@ -196,7 +311,7 @@ def set_voice(voice_id: str) -> None:
     CURRENT_VOICE = voice_id
 
 
-def _safe_tts_chunks(tts_pipeline, text: str):
+def _safe_tts_chunks(tts_cache: dict, text: str):
     """Kokoro's G2P can crash with `TypeError: unsupported operand type(s)
     for +: 'NoneType' and 'str'` on certain text (a token gets no phonemes
     assigned) instead of failing gracefully -- caught live, it took the
@@ -207,17 +322,18 @@ def _safe_tts_chunks(tts_pipeline, text: str):
     if not safe_text:
         return
     try:
-        yield from tts_pipeline(safe_text, voice=CURRENT_VOICE)
+        pipeline = _get_tts_pipeline(tts_cache)
+        yield from pipeline(safe_text, voice=CURRENT_VOICE)
     except Exception as e:
         print(f"[krishna] TTS failed on this text, skipping speech: {e}")
         return
 
 
-def synthesize(tts_pipeline, text: str) -> np.ndarray:
+def synthesize(tts_cache: dict, text: str) -> np.ndarray:
     """Text -> Kokoro's raw float32 audio at 24kHz, no playback. Split out
     from speak() so the avatar path can get the same audio Whisper will
     analyze for lip-sync timing, instead of duplicating synthesis."""
-    chunks = [audio for _, _, audio in _safe_tts_chunks(tts_pipeline, text)]
+    chunks = [audio for _, _, audio in _safe_tts_chunks(tts_cache, text)]
     return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
 
 
@@ -226,8 +342,11 @@ def word_timing(whisper_model: WhisperModel, audio: np.ndarray) -> dict:
     generated speech-OUT to get real word-level timestamps -- this is the
     local, no-cloud alternative to TalkingHead's default Google-Cloud-TTS-
     based lip-sync timing. Returns {words, wtimes, wdurations} in the exact
-    shape TalkingHead's speakAudio() expects (times/durations in ms)."""
-    segments, _ = whisper_model.transcribe(audio, language="en", word_timestamps=True)
+    shape TalkingHead's speakAudio() expects (times/durations in ms). Only
+    called for AVATAR_CAPABLE_LANGUAGES, but still reads CURRENT_LANGUAGE
+    rather than assuming English."""
+    segments, _ = whisper_model.transcribe(
+        audio, language=LANGUAGES[CURRENT_LANGUAGE]["whisper"], word_timestamps=True)
     words, wtimes, wdurations = [], [], []
     for seg in segments:
         for w in seg.words:
@@ -237,8 +356,8 @@ def word_timing(whisper_model: WhisperModel, audio: np.ndarray) -> dict:
     return {"words": words, "wtimes": wtimes, "wdurations": wdurations}
 
 
-def speak(tts_pipeline, text: str) -> None:
-    for _, _, audio in _safe_tts_chunks(tts_pipeline, text):
+def speak(tts_cache: dict, text: str) -> None:
+    for _, _, audio in _safe_tts_chunks(tts_cache, text):
         sd.play(audio, samplerate=24000)
         sd.wait()
 
@@ -257,12 +376,12 @@ def _enter_pressed() -> bool:
     return hit
 
 
-def speak_interruptible(tts_pipeline, text: str) -> bool:
+def speak_interruptible(tts_cache: dict, text: str) -> bool:
     """Same as speak(), but stops immediately if you press Enter while it's
     talking. Returns True if you interrupted it, False if it finished on its
     own -- the caller uses this to stop queuing more sentences once you've
     clearly indicated you want to cut in."""
-    for _, _, audio in _safe_tts_chunks(tts_pipeline, text):
+    for _, _, audio in _safe_tts_chunks(tts_cache, text):
         sd.play(audio, samplerate=24000)
         while sd.get_stream().active:
             if _enter_pressed():
@@ -317,7 +436,7 @@ def think(model: str, history: list) -> str:
     return response["message"]["content"]
 
 
-def think_and_speak(tts_pipeline, model: str, history: list) -> str:
+def think_and_speak(tts_cache: dict, model: str, history: list) -> str:
     """Streams the reply and speaks each completed SENTENCE as soon as it's
     ready, instead of waiting for the entire response to finish generating
     first -- first-sentence latency instead of full-reply latency, which is
@@ -346,10 +465,10 @@ def think_and_speak(tts_pipeline, model: str, history: list) -> str:
             sentence = buffer[:m.end()].strip()
             buffer = buffer[m.end():]
             if sentence:
-                interrupted = speak_interruptible(tts_pipeline, sentence)
+                interrupted = speak_interruptible(tts_cache, sentence)
             m = _SENTENCE_END.search(buffer)
     if buffer.strip() and not interrupted:
-        speak_interruptible(tts_pipeline, buffer.strip())
+        speak_interruptible(tts_cache, buffer.strip())
     return full_reply
 
 

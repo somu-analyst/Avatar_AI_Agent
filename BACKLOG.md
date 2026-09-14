@@ -91,12 +91,44 @@ Tested Docker-sandboxed Open Interpreter on the Oracle VM (2026-09-12).
   means anything.
 - **Background picker** -- currently a fixed dark color behind the avatar;
   needs a background-image/color option in avatar_widget.py.
-- **Multi-language support** -- "pick any language" touches the WHOLE
-  pipeline, not one setting: Whisper's transcribe (`language="en"`
-  hardcoded in both `transcribe()` and `word_timing()`), Kokoro's
-  `lang_code="a"` (American English) and per-language voice sets,
-  TalkingHead's `lipsyncModules: ["en"]`. Real, multi-file scope -- not a
-  quick add.
+- **Multi-language support -- DONE for 7 languages, 2026-09-13.** English
+  (US/UK), French, Hindi, Spanish, Italian, Portuguese (Brazil) all verified
+  live end-to-end (real synthesized audio, non-empty, through krishna.py
+  itself, not a mocked test). Scope decision (asked, you picked): voice-only
+  everywhere; the avatar only renders for English/French, since
+  TalkingHead's lip-sync viseme modules (checked against the real repo)
+  only exist for English/French/German/Finnish/Lithuanian -- every other
+  language can speak, it just can't drive correct mouth shapes, so the UI
+  hides the avatar toggle for those rather than showing a mismatched one.
+  Two real bugs found and fixed, not assumed:
+  1. Kokoro's non-English voices need espeak-ng, which misaki (Kokoro's
+     G2P) only looks for at the standard ELEVATED-install path
+     (`C:\Program Files\eSpeak NG\`). Installed espeak-ng WITHOUT admin
+     rights via `msiexec /a` (an "administrative install" that just
+     extracts files, a legitimate MSI feature, not a workaround), copied
+     into the project at `vendor/espeak-ng/` (gitignored, ~25MB). Calling
+     misaki's hardcoded lookup with the wrong path didn't just fail
+     quietly -- it crashed with a native access violation. Fixed by setting
+     `EspeakWrapper.set_library()`/`set_data_path()` directly in
+     krishna.py, before `kokoro` is ever imported, so misaki's own broken
+     check gets skipped entirely.
+  2. Holding more than ~4 Kokoro `KPipeline` objects alive simultaneously
+     in one process corrupts it (verified live: a trivially small ~256KB
+     allocation starts failing with "not enough memory" -- a native-state
+     corruption symptom, not a real shortage). `_get_tts_pipeline()` now
+     evicts every other language's pipeline before building a new one --
+     costs a few seconds to reload if you switch back to an earlier
+     language, a real but minor and far safer trade.
+  - **Mandarin and Japanese deliberately left out.** Our installed
+    `kokoro==0.2.2` is ~15 minor versions behind latest (0.7.16) and never
+    had these in its own language map at all -- confirmed by reading its
+    source, not assumed. No env var or `misaki[zh]`/`misaki[ja]` extra
+    fixes a package that's simply missing the feature. Japanese's own extra
+    additionally needs compiling `mojimoji` from source, which needs
+    Microsoft's C++ Build Tools (a real multi-GB system install). Real fix
+    is upgrading `kokoro` itself -- a big enough jump to deserve its own
+    tested pass, not bundled into this one, since it risks the already-
+    verified English/avatar path working today.
 
 ## In progress — photorealistic avatar (SadTalker), 2026-09-13
 Goal: real GPU-based talking-head video generation, for live speaking first
