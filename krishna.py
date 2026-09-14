@@ -280,6 +280,45 @@ LANGUAGES: dict[str, dict] = {
     # verified English/avatar path -- see BACKLOG.md.
 }
 
+# Indian languages, via Meta's MMS-TTS instead of Kokoro -- Kokoro has no
+# voice models for ANY of these except Hindi, so this is a second engine
+# rather than more entries for the first one. One ~145MB VITS model per
+# language, CPU-only, verified on Telugu at 2.8x realtime (fast enough for
+# conversation). Each takes its native script directly -- no G2P/espeak
+# layer, which is also why _safe_tts_chunks must NOT run its ASCII
+# sanitizer on these (it would erase the text entirely).
+# Honest limit: ONE voice per language, so no accent choice. Multiple
+# Telugu voices/accents needs AI4Bharat's IndicF5, which is a gated model
+# (needs an access request on your Hugging Face account) -- see BACKLOG.md.
+_MMS_LANGUAGES = {
+    "Telugu":    ("te", "tel"),
+    "Tamil":     ("ta", "tam"),
+    "Kannada":   ("kn", "kan"),
+    "Malayalam": ("ml", "mal"),
+    "Marathi":   ("mr", "mar"),
+    "Bengali":   ("bn", "ben"),
+    "Gujarati":  ("gu", "guj"),
+    "Punjabi":   ("pa", "pan"),
+    "Odia":      ("or", "ory"),
+    "Assamese":  ("as", "asm"),
+}
+for _name, (_whisper_code, _mms_code) in _MMS_LANGUAGES.items():
+    LANGUAGES[_name] = {
+        "whisper": _whisper_code,
+        "engine": "mms",
+        "mms": _mms_code,
+        "voices": {f"{_name} (MMS)": f"mms_{_mms_code}"},
+    }
+
+# Hindi is the one overlap: Kokoro HAS Hindi voices (4 of them, already
+# above) and MMS has a Hindi model too. Kokoro's entry stays the default
+# since more voices is better; this adds the MMS one as an alternative
+# rather than replacing it.
+LANGUAGES["Hindi (MMS voice)"] = {
+    "whisper": "hi", "engine": "mms", "mms": "hin",
+    "voices": {"Hindi (MMS)": "mms_hin"},
+}
+
 # TalkingHead's own lip-sync viseme modules (checked against the real repo:
 # modules/lipsync-{de,en,fi,fr,lt}.mjs) only exist for these languages of
 # the ones above -- every other language can still speak fine through
@@ -311,6 +350,31 @@ def set_voice(voice_id: str) -> None:
     CURRENT_VOICE = voice_id
 
 
+def _mms_synthesize(tts_cache: dict, text: str) -> np.ndarray:
+    """Meta's MMS-TTS, used for the Indian languages Kokoro has no voices
+    for at all. One model per language (~145MB), plain VITS through
+    transformers -- no espeak, no G2P layer, it takes the native script
+    directly. Cached in the same dict as Kokoro's pipelines, under an
+    'mms:<code>' key so the two engines can't collide, and evicted the same
+    way (see _get_tts_pipeline for why more than a few live models at once
+    corrupts the process)."""
+    import torch
+    from transformers import AutoTokenizer, VitsModel
+
+    code = LANGUAGES[CURRENT_LANGUAGE]["mms"]
+    key = f"mms:{code}"
+    if key not in tts_cache:
+        tts_cache.clear()
+        model_id = f"facebook/mms-tts-{code}"
+        tts_cache[key] = (AutoTokenizer.from_pretrained(model_id),
+                          VitsModel.from_pretrained(model_id))
+    tok, model = tts_cache[key]
+    inputs = tok(text, return_tensors="pt")
+    with torch.no_grad():
+        wave = model(**inputs).waveform
+    return wave.squeeze().cpu().numpy().astype(np.float32)
+
+
 def _safe_tts_chunks(tts_cache: dict, text: str):
     """Kokoro's G2P can crash with `TypeError: unsupported operand type(s)
     for +: 'NoneType' and 'str'` on certain text (a token gets no phonemes
@@ -318,6 +382,19 @@ def _safe_tts_chunks(tts_cache: dict, text: str):
     whole Streamlit app down mid-reply. Sanitizes first; if it STILL fails,
     yields nothing rather than crashing, so a bad reply just goes unspoken
     instead of taking the app down."""
+    lang = LANGUAGES[CURRENT_LANGUAGE]
+    if lang.get("engine") == "mms":
+        # Deliberately NOT sanitized: _sanitize_for_tts strips everything
+        # outside ASCII, which would erase Telugu/Hindi/Tamil text entirely.
+        # That sanitizer exists for Kokoro's G2P crash, which MMS doesn't
+        # share -- it takes native script directly.
+        try:
+            audio = _mms_synthesize(tts_cache, text.strip())
+            if len(audio):
+                yield None, None, audio
+        except Exception as e:
+            print(f"[krishna] TTS failed on this text, skipping speech: {e}")
+        return
     safe_text = _sanitize_for_tts(text)
     if not safe_text:
         return
@@ -329,10 +406,44 @@ def _safe_tts_chunks(tts_cache: dict, text: str):
         return
 
 
+def prepare_voice(tts_cache: dict) -> None:
+    """Loads the current language's model NOW rather than lazily mid-reply.
+    An MMS language pulls a ~145MB model on first use; doing that silently
+    inside a reply looks like an unexplained hang, so the UI calls this up
+    front where it can show what's happening."""
+    if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms":
+        _mms_synthesize(tts_cache, "ok")
+
+
+def current_sample_rate() -> int:
+    """Kokoro is 24kHz, MMS-TTS is 16kHz. Playing one at the other's rate
+    is exactly the pitch/speed distortion already hit once with the avatar
+    (it defaulted to 22050 against Kokoro's 24000), so every playback site
+    asks here rather than hardcoding."""
+    return 16000 if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms" else 24000
+
+
+VOLUME = 1.0
+
+
+def set_volume(level: float) -> None:
+    """1.0 = the model's own output level. Above 1.0 genuinely amplifies,
+    so it's clipped at playback to avoid the crackle of a wrapped waveform."""
+    global VOLUME
+    VOLUME = max(0.0, float(level))
+
+
+def _apply_volume(audio: np.ndarray) -> np.ndarray:
+    if VOLUME == 1.0:
+        return audio
+    return np.clip(audio * VOLUME, -1.0, 1.0)
+
+
 def synthesize(tts_cache: dict, text: str) -> np.ndarray:
-    """Text -> Kokoro's raw float32 audio at 24kHz, no playback. Split out
-    from speak() so the avatar path can get the same audio Whisper will
-    analyze for lip-sync timing, instead of duplicating synthesis."""
+    """Text -> raw float32 audio, no playback. Split out from speak() so the
+    avatar path can get the same audio Whisper will analyze for lip-sync
+    timing, instead of duplicating synthesis. Sample rate depends on the
+    engine -- see current_sample_rate()."""
     chunks = [audio for _, _, audio in _safe_tts_chunks(tts_cache, text)]
     return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
 
@@ -358,7 +469,7 @@ def word_timing(whisper_model: WhisperModel, audio: np.ndarray) -> dict:
 
 def speak(tts_cache: dict, text: str) -> None:
     for _, _, audio in _safe_tts_chunks(tts_cache, text):
-        sd.play(audio, samplerate=24000)
+        sd.play(_apply_volume(audio), samplerate=current_sample_rate())
         sd.wait()
 
 
@@ -382,7 +493,7 @@ def speak_interruptible(tts_cache: dict, text: str) -> bool:
     own -- the caller uses this to stop queuing more sentences once you've
     clearly indicated you want to cut in."""
     for _, _, audio in _safe_tts_chunks(tts_cache, text):
-        sd.play(audio, samplerate=24000)
+        sd.play(_apply_volume(audio), samplerate=current_sample_rate())
         while sd.get_stream().active:
             if _enter_pressed():
                 sd.stop()
@@ -397,31 +508,99 @@ _SENTENCE_END = re.compile(r"[.!?]+(?:\s|$)")
 _TOOL_FUNCS = {f.__name__: f for f in _tools.ALL_TOOLS}
 
 
+# Words that suggest a question actually needs live data. Deliberately
+# generous -- a false positive costs one slow pass (what every message used
+# to pay), while a false negative means answering from a stale training
+# cutoff, which is the whole problem this feature exists to fix.
+_TOOL_HINTS = (
+    # weather
+    "weather", "temperature", "forecast", "raining", "rain", "snow", "humid",
+    "hot ", "cold ", "climate",
+    # money / currency
+    "convert", "currency", "exchange rate", "usd", "eur", "inr", "gbp", "yen",
+    "dollar", "rupee", "euro", "pound",
+    # stocks
+    "stock", "share price", "shares", "ticker", "nasdaq", "dow", "s&p",
+    "market", "trading at", "stock price",
+    # sports
+    "score", "scored", "game", "match", "played", "beat", "won", "lost",
+    "fixture", "league", "tournament",
+    # dictionary
+    "define", "definition", "meaning of", "what does", "spell",
+    # jokes
+    "joke", "funny", "make me laugh",
+    # price-shaped phrasings
+    "how much is", "what is the price", "cost of",
+    # NOTE: bare time words ("today", "now", "currently", "latest") are
+    # deliberately NOT hints. They were, and "how are you doing today?"
+    # then paid the full 22s tool pass for an ordinary greeting. The
+    # domain words above already cover the real cases -- "price today"
+    # matches on "price", "weather today" on "weather".
+)
+
+
+def _might_need_tool(history: list) -> bool:
+    """Cheap keyword gate in front of the tool-detection pass. Measured: that
+    pass costs ~18s of a ~20s reply, because handing the model 6 tool schemas
+    bloats every prompt -- and it was running on EVERY message, including
+    "say hi" (where it even produced a bogus tool call). Gating it means
+    ordinary conversation skips the cost entirely and only genuinely
+    data-shaped questions pay it."""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            text = str(msg.get("content", "")).lower()
+            return any(hint in text for hint in _TOOL_HINTS)
+    return False
+
+
 def _resolve_tools(model: str, history: list) -> list:
     """One non-streaming pre-pass to check if the model wants a live-data
-    tool (weather/currency/dictionary/jokes -- see tools.py) before actually
-    answering. This is THE fix for "my knowledge cutoff is December 2023":
-    no local model can know anything past its training cutoff no matter how
-    it's prompted -- the only real fix is fetching live data and handing it
-    to the model as context for THIS answer, which is what this does.
+    tool (weather/currency/stocks/sports/dictionary/jokes -- see tools.py)
+    before actually answering. This is THE fix for "my knowledge cutoff is
+    December 2023": no local model can know anything past its training
+    cutoff no matter how it's prompted -- the only real fix is fetching live
+    data and handing it to the model as context for THIS answer.
     Returns history unchanged if no tool was needed (the common case), or
     history + the tool call + its real result appended, ready for the
     caller to get a final answer grounded in that real data."""
+    if not _might_need_tool(history):
+        return history
     check = ollama.chat(model=model, messages=history, tools=_tools.ALL_TOOLS,
                         keep_alive=KEEP_ALIVE)
     calls = check["message"].get("tool_calls")
     if not calls:
         return history
     working = history + [check["message"]]
+    results = []
     for call in calls:
-        fn = _TOOL_FUNCS.get(call["function"]["name"])
+        name = call["function"]["name"]
+        fn = _TOOL_FUNCS.get(name)
         if not fn:
             continue
         try:
             result = fn(**call["function"]["arguments"])
         except Exception as e:
             result = f"Tool call failed: {e}"
-        working.append({"role": "tool", "content": str(result)})
+        results.append(str(result))
+        # `name` matters: without it the model doesn't connect the result to
+        # the call it just made, and llama3.2:3b would answer "I don't have
+        # real-time access" while literally holding the fetched value.
+        working.append({"role": "tool", "name": name, "content": str(result)})
+    if results:
+        # Belt and braces on top of the tool role. Even with a named tool
+        # message this model kept deflecting ("you can check a financial
+        # website") while holding the real number, so the data is also
+        # restated as a plain instruction it can't miss. Verified: this is
+        # what stopped the deflection.
+        working.append({
+            "role": "user",
+            "content": ("Here is the real, current data just looked up for my "
+                        "question: " + " | ".join(results) +
+                        "\nAnswer using these exact figures. Do not say you "
+                        "lack real-time access, do not suggest I check "
+                        "elsewhere, and do not call this a sample -- this is "
+                        "the genuine current answer."),
+        })
     return working
 
 

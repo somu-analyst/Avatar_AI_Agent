@@ -130,7 +130,7 @@ def _container_div(height: int) -> str:
             f'background:{background};border-radius:12px"></div>')
 
 
-def _base_script(speak_js: str) -> str:
+def _base_script(speak_js: str, sample_rate: int = 24000) -> str:
     return f"""
 <script type="importmap">
 {{
@@ -147,7 +147,7 @@ def _base_script(speak_js: str) -> str:
     ttsEndpoint: "",
     lipsyncModules: ["en"],
     cameraView: "upper",
-    pcmSampleRate: 24000
+    pcmSampleRate: {sample_rate}
   }});
   await head.showAvatar({_avatar_config_json()});
   {speak_js}
@@ -156,7 +156,8 @@ def _base_script(speak_js: str) -> str:
 
 
 def render_speaking(audio_f32: np.ndarray, words: list[str], wtimes: list[int],
-                    wdurations: list[int], height: int = 420, speak: bool = True) -> None:
+                    wdurations: list[int], height: int = 420, speak: bool = True,
+                    sample_rate: int = 24000) -> None:
     """Loads the avatar. Only calls speakAudio() when speak=True -- when
     False, this renders the SAME reply's face on a page rerun that isn't a
     genuinely new turn (Streamlit reruns the whole script on ANY widget
@@ -166,7 +167,7 @@ def render_speaking(audio_f32: np.ndarray, words: list[str], wtimes: list[int],
     speaking"; the caller (app.py) is responsible for only passing
     speak=True once per new reply via a turn-id check."""
     if not speak:
-        components.html(_container_div(height) + _base_script(""), height=height)
+        components.html(_container_div(height) + _base_script("", sample_rate), height=height)
         return
     audio_b64 = _audio_to_pcm16_b64(audio_f32)
     speak_js = (
@@ -177,7 +178,7 @@ def render_speaking(audio_f32: np.ndarray, words: list[str], wtimes: list[int],
         f'    {{}}, () => {{}}\n'
         f'  );'
     )
-    components.html(_container_div(height) + _base_script(speak_js), height=height)
+    components.html(_container_div(height) + _base_script(speak_js, sample_rate), height=height)
 
 
 def render_idle(height: int = 420) -> None:
