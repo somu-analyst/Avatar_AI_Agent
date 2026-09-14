@@ -51,6 +51,24 @@ if _lang not in AVATAR_CAPABLE_LANGUAGES:
               "lip-sync only has real mouth-shape data for English and French; "
               "every other language still speaks normally, just without the "
               "avatar view.")
+elif st.session_state.get("avatar_on"):
+    # Only shown once the avatar is actually on -- two more selectors sitting
+    # there permanently would crowd the top of the page for the (common) case
+    # of just talking with no avatar.
+    _av_col, _bg_col = st.columns([1, 1])
+    with _av_col:
+        _avatar_choice = st.selectbox(
+            "🧑 Avatar face", list(avatar_widget.AVATARS.keys()),
+            index=list(avatar_widget.AVATARS.keys()).index(avatar_widget.DEFAULT_AVATAR),
+            key="avatar_choice")
+    with _bg_col:
+        _bg_choice = st.selectbox(
+            "🎨 Background", list(avatar_widget.BACKGROUNDS.keys()),
+            index=list(avatar_widget.BACKGROUNDS.keys()).index(
+                avatar_widget.DEFAULT_BACKGROUND),
+            key="background_choice")
+    avatar_widget.set_avatar(_avatar_choice)
+    avatar_widget.set_background(_bg_choice)
 
 if "history" not in st.session_state:
     st.session_state.history = load_history()
