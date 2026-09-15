@@ -260,8 +260,15 @@ and sources: https://claude.ai/artifact/47nKMqntqN1TszmfZrkPgB
   Stack B (Gemini Live native audio, free tier, Telugu voice unproven).
   Photoreal face after the audio is fast: Anam (20 free min/month) or
   Simli. Decide against the targets in the report.
+- **Gnani.ai (asked about):** claims the best Indian-language accuracy
+  (own benchmark: first in 8 of 9 languages, 18% lower error on Dravidian
+  languages than Sarvam/ElevenLabs/Deepgram), Telugu STT and TTS (~200 ms,
+  <250 ms p95), and Inya VoiceOS, a 5B Indian-language speech-to-speech
+  model (sub-second, <10% WER claimed for Telugu). Enterprise-sales only:
+  no public pricing, trial or self-serve API. Added to the report as
+  Stack C, to test only if they grant access; doesn't block Stack A.
 - **Waiting on you:** go-ahead for Phase 1; a Sarvam account; a Google AI
-  Studio key.
+  Studio key; optionally a Gnani.ai demo request.
 
 ## Open questions (waiting on you)
 - **Gmail access** -- you asked for "all the daily used" APIs including
