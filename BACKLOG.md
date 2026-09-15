@@ -198,6 +198,71 @@ sources, not one path.
   this loop slow. Saturn Cloud (T4, free tier) is a simpler third option.
   SageMaker Studio Lab is closing to new signups -- skip.
 
+## 2026-09-14 -- fast mode, Auto language, real backgrounds
+- **Fast mode (Groq cloud) -- your call, overriding the original fully-local
+  principle** ("use cloud if you want, in local it may be late"). Default on
+  when a key exists, toggle in the sidebar that states what's sent (voice
+  recording + conversation text); memory, notes and Krishna's voice stay
+  local; any cloud error falls back to the local path. Model choice was
+  measured, not assumed: gpt-oss-120b gave ~0.4s to first token, proper
+  Telugu script, and correct tool calls (qwen3.8-27b was faster but its
+  Telugu was weaker). STT is whisper-large-v3-turbo (0.6s, and correct
+  Devanagari where local Whisper transliterated Hindi into English).
+  Groq key reused from the NYSE_DATA vault, same as Finnhub; separate key
+  is a backlog item.
+- **Auto language (English / Hindi / Telugu)** is the default. Unrestricted
+  detection called a Telugu clip "Tamil" on BOTH local and Groq Whisper --
+  which then started a silent first-time Tamil voice download mid-reply,
+  the likely cause of "shows transcribing but not working". Restricted to
+  the three languages you speak, it picked Telugu correctly. An explicitly
+  selected language is now forced, never guessed.
+- **Replies in the selected language.** Nothing ever told the model which
+  language to answer in, so Telugu selected still got English. Now a
+  per-turn instruction does; romanized Telugu ("ela unnav") is understood.
+  The voice follows the reply's script, so a Telugu reply is spoken by the
+  Telugu voice and an English one never reaches a Telugu model.
+- **No invented facts.** "hows wheater" (typo) missed the keyword gate and
+  the model made up "75°F, partly cloudy". Fast mode offers tools every
+  turn; local mode's gate now tolerates typos and treats short follow-ups
+  ("iselin nj") as continuing the previous question. Home location is
+  Iselin, NJ; weather reports °F too and resolves "Iselin, NJ" correctly.
+- **Bugs found on the way:** the TTS sanitizer's ASCII whitelist was
+  deleting accented and non-Latin letters (French "réel" -> "r el"; Kokoro
+  Hindi 0.6s -> 3.5s after the fix). Avatar lip-sync fed Whisper 24kHz audio
+  it assumed was 16kHz, stretching every timestamp 1.5x.
+- **Backgrounds:** 16 free-license photos from Wikimedia Commons -- NYSE
+  floor, Wall Street, Charging Bull, Manhattan and Mumbai skylines, BSE
+  Dalal Street, Charminar, libraries, Himalayas, Kerala backwaters.
+  Attribution in static/avatar/backgrounds/ATTRIBUTION.md and shown in the
+  sidebar. Rejected after visual check: scanned historic office photos, a
+  hotel labelled "HITEC City", a thin panorama, a bull hidden behind a cop.
+- **Avatars:** MPFB (CC0, realistic proportions) added -- 6 total.
+  **Brahmanandam avatar declined:** a talking likeness of a real person
+  without consent is a deepfake. Offered instead: a comedic Telugu
+  personality for the replies with an original face -- waiting on you.
+- **Next latency idea from research:** an instant filler/backchannel
+  ("hmm", "let me check") before the real reply -- measured elsewhere to
+  cut perceived latency 300-500ms. Not built yet.
+
+## 2026-09-15 -- stack research (report, awaiting your call)
+Full report with measurements, a to-scale latency chart, options per layer
+and sources: https://claude.ai/artifact/47nKMqntqN1TszmfZrkPgB
+- **Root causes measured:** Telugu speech heard as Hindi/Tamil; TalkingHead's
+  lip-sync rules only match Latin letters, so Telugu script produces zero
+  mouth shapes; avatar path makes the voice on the CPU all at once (5.1 s
+  for 8 s of English audio) plus a second Whisper pass and an avatar reload
+  per reply (one app test: 38 s); no clock, so the date was guessed with
+  Bengali digits.
+- **Recommendation:** Phase 1 fixes with no new accounts (clock, HeadAudio
+  audio-driven mouth, drop the Whisper timing pass, avatar via Krishna
+  Live). Then test Stack A (Sarvam Saaras v3 -> Groq gpt-oss-120b -> Sarvam
+  Bulbul v3, ≈1.7 s estimated first audio, ₹100 free credits) against
+  Stack B (Gemini Live native audio, free tier, Telugu voice unproven).
+  Photoreal face after the audio is fast: Anam (20 free min/month) or
+  Simli. Decide against the targets in the report.
+- **Waiting on you:** go-ahead for Phase 1; a Sarvam account; a Google AI
+  Studio key.
+
 ## Open questions (waiting on you)
 - **Gmail access** -- you asked for "all the daily used" APIs including
   Gmail; this is a different risk category than the public read-only APIs

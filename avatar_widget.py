@@ -14,6 +14,7 @@ real, separate engineering, not built here.
 from __future__ import annotations
 import base64
 import json
+from pathlib import Path
 
 import numpy as np
 import streamlit.components.v1 as components
@@ -62,24 +63,76 @@ AVATARS: dict[str, dict] = {
     "Brunette (alternate build)": {
         "file": "brunette-t.glb", "body": "F", "mood": "neutral",
     },
+    # MakeHuman/MPFB (CC0) -- realistic body proportions. Lacks only the
+    # `viseme_sil` (silence) mouth shape, which TalkingHead tolerates; it ships
+    # this avatar in its own demo.
+    "MPFB (realistic proportions)": {
+        "file": "mpfb.glb", "body": "F", "mood": "happy",
+        "baseline": {"headRotateX": -0.01, "eyeBlinkLeft": 0.05,
+                     "eyeBlinkRight": 0.05},
+    },
 }
 DEFAULT_AVATAR = "Brunette (Ready Player Me)"
 
-# Plain CSS applied to the container behind the avatar. Kept to colours and
-# gradients rather than photos on purpose: the avatar is rendered on a
-# transparent WebGL canvas, so anything busy behind it reads as noise around
-# the head rather than a backdrop.
+# Photo backgrounds: free-license images from Wikimedia Commons, credits in
+# static/avatar/backgrounds/credits.json (CC BY / CC BY-SA require keeping the
+# attribution, shown in the sidebar when one is selected).
+_BG_DIR = Path(__file__).resolve().parent / "static" / "avatar" / "backgrounds"
+_BG_URL = "/app/static/avatar/backgrounds"
+_PHOTO_LABELS = {
+    "nyse-trading-floor-1.jpg": "Wall Street -- NYSE trading floor",
+    "nyse-trading-floor-2.jpg": "Wall Street -- NYSE floor (classic)",
+    "wall-street-1.jpg": "Wall Street -- NYSE facade",
+    "charging-bull-1.jpg": "Wall Street -- Charging Bull",
+    "manhattan-skyline-1.jpg": "Manhattan skyline (night)",
+    "manhattan-skyline-2.jpg": "Manhattan skyline (day)",
+    "bse-dalal-street-1.jpg": "Dalal Street -- BSE Mumbai",
+    "mumbai-skyline-1.jpg": "Mumbai skyline (night)",
+    "mumbai-skyline-2.jpg": "Mumbai skyline (day)",
+    "hyderabad-charminar-2.jpg": "Hyderabad -- Charminar",
+    "hyderabad-charminar-1.jpg": "Hyderabad -- Charminar (detail)",
+    "library-1.jpg": "Library",
+    "library-2.jpg": "Library (modern)",
+    "himalayas-1.jpg": "Himalayas (snow lake)",
+    "himalayas-2.jpg": "Himalayas (valley)",
+    "kerala-backwaters-1.jpg": "Kerala backwaters",
+}
+
+
+def _load_credits() -> dict[str, dict]:
+    try:
+        return {c["file"]: c for c in json.loads(
+            (_BG_DIR / "credits.json").read_text(encoding="utf-8"))}
+    except Exception:
+        return {}
+
+
+_CREDITS = _load_credits()
+
+# CSS for the container behind the avatar; it renders on a transparent WebGL
+# canvas, so this is what shows around it.
 BACKGROUNDS: dict[str, str] = {
-    "Charcoal (default)": "#1a1a1a",
+    label: f"url('{_BG_URL}/{fname}') center / cover no-repeat"
+    for fname, label in _PHOTO_LABELS.items() if (_BG_DIR / fname).exists()
+}
+BACKGROUNDS.update({
+    "Charcoal": "#1a1a1a",
     "Slate": "#2b3137",
     "Deep blue": "linear-gradient(160deg, #0f2027, #203a43, #2c5364)",
-    "Warm grey": "#3a3532",
     "Studio purple": "linear-gradient(160deg, #2b1055, #44318d)",
-    "Forest": "linear-gradient(160deg, #0b3d2c, #1d6f4d)",
     "Sunset": "linear-gradient(160deg, #3a1c71, #d76d77, #ffaf7b)",
     "Plain white": "#f2f2f2",
-}
-DEFAULT_BACKGROUND = "Charcoal (default)"
+})
+DEFAULT_BACKGROUND = next(iter(BACKGROUNDS))
+
+
+def background_credit(name: str) -> str | None:
+    """Attribution line for a photo background, None for plain colours."""
+    fname = next((f for f, label in _PHOTO_LABELS.items() if label == name), None)
+    c = _CREDITS.get(fname or "")
+    if not c:
+        return None
+    return f"Photo: {c['title']} -- {c['author']}, {c['license']} (Wikimedia Commons)"
 
 CURRENT_AVATAR = DEFAULT_AVATAR
 CURRENT_BACKGROUND = DEFAULT_BACKGROUND

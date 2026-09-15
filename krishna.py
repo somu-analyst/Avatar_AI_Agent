@@ -1,21 +1,34 @@
 #!/usr/bin/env python
-"""Krishna -- a fully local, private voice companion.
+"""Krishna -- a private voice companion, local-first with an optional fast
+cloud mode.
 
-Push-to-talk loop: press Enter to start recording, speak, press Enter again
-to stop. Transcribes (Whisper, local) -> thinks (Ollama, local) -> speaks
-(Kokoro, local). Nothing here ever leaves this machine -- no Anthropic, no
-OpenAI, no cloud API of any kind at runtime. That's the whole point.
+Push-to-talk loop: press Enter, speak, and it stops recording once you go
+quiet. Transcribes (Whisper) -> thinks (LLM) -> speaks (Kokoro / MMS-TTS).
+
+Two brains, chosen by CLOUD_MODE:
+  - local : faster-whisper + Ollama llama3.2:3b. Nothing leaves the machine,
+            but a reply takes seconds on this CPU, and the 3B model can't
+            follow Telugu or Telugu typed in English letters ("ela unnav").
+  - cloud : Groq -- whisper-large-v3-turbo + gpt-oss-120b. The voice
+            recording and conversation text go to Groq; memory, notes and
+            Krishna's own voice stay here. Measured ~0.4s to first word
+            (vs 3-20s local), proper Telugu script, and correct tool calls.
+Cloud mode was switched on at the user's request (2026-09-14) for speed. Any
+cloud error falls back to the local path rather than failing the turn.
 
 Usage:
     python krishna.py
 """
 from __future__ import annotations
-import collections
+import difflib
+import io
 import json
 import queue
 import re
 import sys
 import time
+import unicodedata
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -29,17 +42,13 @@ import tools as _tools
 
 ROOT = Path(__file__).resolve().parent
 
-# Kokoro's non-English voices need espeak-ng for phonemization (English has
-# its own built-in fallback G2P, which is why the English-only version of
-# this project never needed this). misaki (Kokoro's G2P layer) only checks
-# the standard admin-install path (C:\Program Files\eSpeak NG\...), which
-# needs an elevated installer we deliberately avoided -- espeak-ng was
-# extracted instead via `msiexec /a` (an unelevated "administrative install"
-# that just unpacks files) into vendor/espeak-ng/. Setting the library AND
-# data path directly here, before `kokoro` is ever imported, makes
-# phonemizer use this copy instead of misaki's hardcoded (and here, absent)
-# path -- calling misaki's own lookup with the wrong path caused a native
-# access violation, not just a graceful "not found".
+# Kokoro's non-English voices need espeak-ng for phonemization. misaki
+# (Kokoro's G2P layer) only checks the standard admin-install path
+# (C:\Program Files\eSpeak NG\...), which needs an elevated installer we
+# deliberately avoided -- espeak-ng was extracted instead via `msiexec /a`
+# into vendor/espeak-ng/. Setting the library AND data path directly here,
+# before `kokoro` is ever imported, makes phonemizer use this copy; calling
+# misaki's own lookup with the wrong path caused a native access violation.
 _ESPEAK_DIR = ROOT / "vendor" / "espeak-ng"
 if (_ESPEAK_DIR / "libespeak-ng.dll").exists():
     from phonemizer.backend.espeak.wrapper import EspeakWrapper
@@ -49,15 +58,16 @@ if (_ESPEAK_DIR / "libespeak-ng.dll").exists():
 MODEL = "llama3.2:3b"
 SAMPLE_RATE = 16000
 # Ollama unloads an idle model by default, which is exactly why the first
-# reply in a session pays a multi-second reload cost. keep_alive holds it
-# resident in memory for the length of an active conversation.
+# reply in a session pays a multi-second reload cost.
 KEEP_ALIVE = "30m"
 
 MEMORY_PATH = ROOT / "memory.json"
 NOTES_PATH = ROOT / "notes.md"
 MAX_HISTORY_TURNS = 40   # trimmed so an old conversation can't grow the prompt forever
 
-SYSTEM_PROMPT = """You are Krishna, a warm, direct, knowledgeable personal companion and
+HOME_LOCATION = "Iselin, New Jersey, USA"
+
+SYSTEM_PROMPT = f"""You are Krishna, a warm, direct, knowledgeable personal companion and
 advisor. You speak naturally and conversationally, like a trusted friend who has real
 expertise -- not like a corporate assistant. Keep responses short and spoken-natural
 (1-3 sentences unless genuinely more is needed) since this is a VOICE conversation, not
@@ -65,14 +75,20 @@ a chat window. Be honest and specific rather than generically encouraging.
 When a tool result appears in the conversation, that is REAL, current data you just
 looked up -- state it directly and specifically (the actual number/fact), in your own
 natural voice. Never deflect, joke about not knowing, or hedge with "check elsewhere"
-when you were just given the real answer -- that's actively wrong, not humble."""
+when you were just given the real answer -- that's actively wrong, not humble.
+You cannot know live facts yourself -- weather, prices, scores, news. Only state them
+from a tool result; if you have none, use a tool or say you'll check. Never invent numbers.
+The user lives in {HOME_LOCATION}. If they ask about weather or anything local without
+naming a place, use {HOME_LOCATION}. Treat short follow-ups (just a place name, "and
+tomorrow?") as continuing the previous question -- never ask them to repeat it.
+The user may write Telugu or Hindi in English letters -- for example "ela unnav" is
+Telugu for "how are you". Understand it naturally."""
 
 
 def load_history() -> list[dict]:
     """Loads past conversation turns from disk so Krishna remembers previous
-    sessions, not just the current one. Plain local JSON -- nothing sent
-    anywhere, same as everything else here. Starts fresh if the file is
-    missing or unreadable rather than crashing on a corrupt/partial file."""
+    sessions. Starts fresh if the file is missing or unreadable rather than
+    crashing on a corrupt/partial file."""
     if MEMORY_PATH.exists():
         try:
             saved = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
@@ -85,10 +101,9 @@ def load_history() -> list[dict]:
 
 def save_history(history: list[dict]) -> None:
     """Everything except the system prompt -- that's reconstructed fresh each
-    load so a SYSTEM_PROMPT edit takes effect on old saved sessions too,
-    instead of an old prompt being frozen into memory.json forever."""
+    load so a SYSTEM_PROMPT edit takes effect on old saved sessions too."""
     to_save = [m for m in history if m["role"] != "system"][-MAX_HISTORY_TURNS:]
-    MEMORY_PATH.write_text(json.dumps(to_save, indent=2), encoding="utf-8")
+    MEMORY_PATH.write_text(json.dumps(to_save, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 _NOTE_TRIGGERS = ("note ", "note:", "remember ", "remember that ", "remember this")
@@ -96,16 +111,11 @@ _NOTE_TRIGGERS = ("note ", "note:", "remember ", "remember that ", "remember thi
 
 def maybe_take_note(text: str) -> str | None:
     """If you say something starting with 'note' or 'remember', this appends
-    it straight to notes.md and returns a confirmation string -- no LLM
-    involved in deciding what gets written, on purpose. That's what keeps
-    this safe: a plain string match and a file append, not an agent deciding
-    for itself what's worth remembering. Returns None for anything else, so
-    normal conversation is untouched."""
+    it straight to notes.md -- no LLM involved in deciding what gets written,
+    on purpose. Returns None for anything else."""
     low = text.strip().lower()
     # Longest trigger first -- "remember that " must be checked before the
-    # shorter "remember " or it never gets a chance to match (caught live:
-    # "remember that the wifi password..." stripped to "that the wifi
-    # password..." because "remember " matched first and won).
+    # shorter "remember " or it never gets a chance to match.
     for trigger in sorted(_NOTE_TRIGGERS, key=len, reverse=True):
         if low.startswith(trigger):
             content = text.strip()[len(trigger):].strip(" :,")
@@ -119,42 +129,37 @@ def maybe_take_note(text: str) -> str | None:
 
 
 def _load_whisper() -> WhisperModel:
-    """'base' (multilingual), not 'base.en' -- the .en variant is English-
-    only at the model level, no language switch could ever make it
-    transcribe anything else. Trades a small amount of English-specific
-    accuracy (base.en edges out base on English alone) for actually
-    supporting every other LANGUAGES entry below."""
+    """'base' (multilingual), not 'base.en' -- the .en variant can't
+    transcribe anything but English. Locally it's used for language
+    detection and as the fallback transcriber; fast mode transcribes on Groq."""
     print("[krishna] loading speech recognition (first run downloads the model)...")
     return WhisperModel("base", device="cpu", compute_type="int8")
 
 
 def _load_tts() -> dict:
-    """Returns an empty pipeline CACHE, not a pipeline -- Kokoro's KPipeline
-    is bound to one lang_code at construction (its G2P is language-specific),
-    so supporting multiple languages means multiple pipeline objects, built
-    lazily by _get_tts_pipeline() as each language is actually used, not one
-    upfront load. Every call site below (synthesize/speak/etc.) takes this
-    cache dict in the same argument position the single pipeline used to
-    occupy."""
+    """Returns an empty model CACHE, not a model -- Kokoro pipelines are bound
+    to one lang_code and MMS models to one language, so models are built
+    lazily as each language is actually used."""
     print("[krishna] voice ready (each language's model loads on first use)...")
     return {}
 
 
+def _evict(tts_cache: dict, engine: str, keep: int) -> None:
+    """Holding ~5 Kokoro pipelines at once corrupted the process (verified:
+    a trivial 256KB allocation started failing -- native-state corruption,
+    not a real shortage), so Kokoro keeps ONE pipeline. MMS models are plain
+    transformers VITS and are allowed two, so Auto mode can hold Telugu and
+    Hindi together instead of reloading on every language switch."""
+    same = [key for key in tts_cache if key.startswith("mms:") == (engine == "mms")]
+    while len(same) >= keep:
+        tts_cache.pop(same.pop(0), None)
+
+
 def _get_tts_pipeline(tts_cache: dict):
-    """Deliberately keeps at most ONE Kokoro pipeline alive at a time, not a
-    real per-language cache -- verified live that holding ~5 simultaneous
-    KPipeline instances in one process corrupts it (a trivially small
-    allocation, e.g. 256KB, starts failing with "not enough memory", which
-    is a native-state corruption symptom, not an actual memory shortage;
-    each language up to the 4th worked fine, the 5th broke the process).
-    Evicting every other language's pipeline before building a new one costs
-    a few seconds to reload if you switch back to a language used earlier
-    in the session -- a real but minor cost, worth paying to not risk a
-    crash after a user picks a 5th language."""
     from kokoro import KPipeline
     kokoro_code = LANGUAGES[CURRENT_LANGUAGE]["kokoro"]
     if kokoro_code not in tts_cache:
-        tts_cache.clear()
+        _evict(tts_cache, "kokoro", keep=1)
         tts_cache[kokoro_code] = KPipeline(lang_code=kokoro_code)
     return tts_cache[kokoro_code]
 
@@ -163,11 +168,9 @@ _SILERO = None
 
 
 def _silero_vad():
-    """Silero VAD, loaded once. It's a small neural model rather than
-    webrtcvad's signal heuristics, and it's markedly better at telling
-    speech from room noise/breath -- which is what decides whether you get
-    cut off mid-sentence. Returns None if unavailable so record_vad falls
-    back to webrtcvad rather than failing."""
+    """Silero VAD, loaded once -- a small neural model, markedly better than
+    webrtcvad at telling speech from room noise, which decides whether you
+    get cut off mid-sentence. Returns None if unavailable (webrtcvad fallback)."""
     global _SILERO
     if _SILERO is None:
         try:
@@ -180,20 +183,11 @@ def _silero_vad():
 
 
 def record_vad(max_seconds: int = 20, silence_ms: int = 900,
-              aggressiveness: int = 2, speech_threshold: float = 0.5) -> np.ndarray:
-    """Records until it detects you've actually stopped talking, instead of
-    a fixed duration -- this was the single biggest source of "not like a
-    real conversation": waiting a fixed N seconds regardless of when you
-    actually finished speaking. Stops after `silence_ms` of quiet following
-    detected speech, or `max_seconds` as a hard cap either way.
-
-    Uses Silero VAD when available (a small neural model -- much better at
-    distinguishing speech from background noise and breaths than webrtcvad's
-    signal heuristics, which is what causes being cut off mid-sentence), and
-    falls back to webrtcvad if it can't load. Silero wants 512-sample frames
-    at 16kHz; webrtcvad wants 10/20/30ms -- 512 samples is 32ms, so the
-    fallback re-slices to 30ms rather than handing webrtcvad a frame size it
-    rejects."""
+               aggressiveness: int = 2, speech_threshold: float = 0.5) -> np.ndarray:
+    """Records until you've actually stopped talking (not a fixed duration).
+    Stops after `silence_ms` of quiet following detected speech, or
+    `max_seconds` as a hard cap. Silero wants 512-sample frames at 16kHz;
+    webrtcvad wants 10/20/30ms, so the fallback uses 30ms frames."""
     model = _silero_vad()
     frame_size = 512 if model is not None else int(SAMPLE_RATE * 30 / 1000)
     frame_ms = frame_size * 1000 / SAMPLE_RATE
@@ -241,20 +235,102 @@ def record_vad(max_seconds: int = 20, silence_ms: int = 900,
     if not frames or not triggered:
         return np.array([], dtype=np.float32)
     audio_i16 = np.concatenate(frames, axis=0).flatten()
-    return (audio_i16.astype(np.float32) / 32768.0)
+    return audio_i16.astype(np.float32) / 32768.0
 
 
-# Whisper's language code -> our LANGUAGES key, for auto-detect. Only the
-# languages we can actually SPEAK back are listed: detecting something we
-# have no voice for would switch Krishna mute, which is worse than
-# answering in the language it was already set to.
-_WHISPER_TO_LANGUAGE = {
-    "en": "English (US)", "fr": "French", "es": "Spanish", "it": "Italian",
-    "pt": "Portuguese (Brazil)", "hi": "Hindi", "te": "Telugu", "ta": "Tamil",
-    "kn": "Kannada", "ml": "Malayalam", "mr": "Marathi", "bn": "Bengali",
-    "gu": "Gujarati", "pa": "Punjabi", "or": "Odia", "as": "Assamese",
-}
+# ---------------------------------------------------------------- cloud (Groq)
 
+GROQ_BASE = "https://api.groq.com/openai/v1"
+GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
+GROQ_STT_MODEL = "whisper-large-v3-turbo"
+
+
+def _groq_key() -> str | None:
+    return _tools._api_key("GROQ_API_KEY")
+
+
+def cloud_available() -> bool:
+    return bool(_groq_key())
+
+
+CLOUD_MODE = cloud_available()
+
+
+def set_cloud_mode(on: bool) -> None:
+    global CLOUD_MODE
+    CLOUD_MODE = bool(on) and cloud_available()
+
+
+def _groq_post(path: str, **kwargs) -> dict:
+    import requests
+    r = requests.post(f"{GROQ_BASE}/{path}", timeout=45,
+                      headers={"Authorization": f"Bearer {_groq_key()}"}, **kwargs)
+    r.raise_for_status()
+    return r.json()
+
+
+_TOOL_SCHEMAS: list | None = None
+
+
+def _tool_schemas() -> list:
+    """OpenAI-format schemas for the same functions Ollama gets, produced by
+    Ollama's own docstring->schema converter so the two paths can't drift."""
+    global _TOOL_SCHEMAS
+    if _TOOL_SCHEMAS is None:
+        from ollama._utils import convert_function_to_tool
+        _TOOL_SCHEMAS = [convert_function_to_tool(f).model_dump(exclude_none=True)
+                         for f in _tools.ALL_TOOLS]
+    return _TOOL_SCHEMAS
+
+
+def _groq_think(messages: list) -> str:
+    """Tools are offered on every turn -- no keyword gate, since the whole
+    round trip is ~0.3-0.6s. That's also what makes a bare follow-up like
+    "iselin nj" work: the model sees the conversation and calls the weather
+    tool itself instead of a keyword list deciding it isn't a weather question."""
+    body = {"model": GROQ_CHAT_MODEL, "reasoning_effort": "low",
+            "include_reasoning": False, "max_tokens": 700}
+    first = _groq_post("chat/completions",
+                       json={**body, "messages": messages, "tools": _tool_schemas()})
+    msg = first["choices"][0]["message"]
+    calls = msg.get("tool_calls") or []
+    if not calls:
+        return (msg.get("content") or "").strip()
+    working = messages + [{"role": "assistant", "content": msg.get("content") or "",
+                           "tool_calls": calls}]
+    for call in calls:
+        name = call["function"]["name"]
+        fn = _TOOL_FUNCS.get(name)
+        try:
+            args = json.loads(call["function"].get("arguments") or "{}")
+            result = fn(**args) if fn else f"Unknown tool: {name}"
+        except Exception as e:
+            result = f"Tool call failed: {e}"
+        working.append({"role": "tool", "tool_call_id": call["id"], "content": str(result)})
+    second = _groq_post("chat/completions", json={**body, "messages": working})
+    return (second["choices"][0]["message"].get("content") or "").strip()
+
+
+def _groq_transcribe(audio: np.ndarray, language_code: str) -> str:
+    import soundfile as sf
+    buf = io.BytesIO()
+    sf.write(buf, audio, SAMPLE_RATE, format="WAV")
+    out = _groq_post("audio/transcriptions",
+                     files={"file": ("speech.wav", buf.getvalue(), "audio/wav")},
+                     data={"model": GROQ_STT_MODEL, "language": language_code,
+                           "response_format": "json"})
+    return (out.get("text") or "").strip()
+
+
+# ------------------------------------------------------------ speech to text
+
+# Auto mode deliberately chooses only between the languages actually spoken
+# here. Unrestricted detection misfires between neighbours -- measured: both
+# local Whisper and Groq's labelled a Telugu clip "Tamil", which switched
+# Krishna to a voice that then began a silent first-time download. Restricted
+# to these three, the same clip picked Telugu (0.78 vs Kannada 0.15).
+_AUTO_CANDIDATES = {"en": "English (US)", "hi": "Hindi (MMS voice)", "te": "Telugu"}
+AUTO_LANGUAGE_LABEL = "Auto (English / Hindi / Telugu)"
 AUTO_LANGUAGE = True
 
 
@@ -263,45 +339,87 @@ def set_auto_language(on: bool) -> None:
     AUTO_LANGUAGE = bool(on)
 
 
+def _detect_language(whisper_model: WhisperModel, audio: np.ndarray) -> str:
+    current = LANGUAGES[CURRENT_LANGUAGE]["whisper"]
+    fallback = current if current in _AUTO_CANDIDATES else "en"
+    if len(audio) < SAMPLE_RATE * 1.0:   # too short to detect reliably
+        return fallback
+    try:
+        _, info = whisper_model.transcribe(audio[:SAMPLE_RATE * 30], language=None,
+                                           without_timestamps=True)
+        probs = dict(info.all_language_probs or [])
+        return max(_AUTO_CANDIDATES, key=lambda c: probs.get(c, 0.0))
+    except Exception as e:
+        print(f"[krishna] language detection failed: {e}")
+        return fallback
+
+
 def transcribe(whisper_model: WhisperModel, audio: np.ndarray) -> str:
-    """With AUTO_LANGUAGE on (the default), Whisper is given no language and
-    detects it from the audio itself -- so you can switch between English,
-    Hindi and Telugu mid-conversation without touching a setting, and
-    Krishna answers in the language you just used. Detection needs enough
-    audio to be reliable, so very short clips keep the current language
-    rather than acting on a coin-flip guess."""
+    """An explicitly chosen language is forced, never guessed. In Auto mode
+    the language is detected (restricted to English/Hindi/Telugu) and
+    Krishna switches to it. Fast mode transcribes on Groq with the language
+    pinned; local Whisper is the fallback."""
     if len(audio) < SAMPLE_RATE * 0.3:   # too short to be real speech
         return ""
-    if AUTO_LANGUAGE and len(audio) >= SAMPLE_RATE * 1.0:
-        segments, info = whisper_model.transcribe(audio, language=None)
-        detected = _WHISPER_TO_LANGUAGE.get(getattr(info, "language", None))
-        if (detected and detected != CURRENT_LANGUAGE
-                and getattr(info, "language_probability", 0) >= 0.6):
-            print(f"[krishna] heard {detected} "
-                  f"({info.language_probability:.0%}) -- switching")
-            set_language(detected)
-        return " ".join(s.text.strip() for s in segments).strip()
-    segments, _ = whisper_model.transcribe(
-        audio, language=LANGUAGES[CURRENT_LANGUAGE]["whisper"])
+    if AUTO_LANGUAGE:
+        code = _detect_language(whisper_model, audio)
+        if _AUTO_CANDIDATES[code] != CURRENT_LANGUAGE:
+            print(f"[krishna] heard {_AUTO_CANDIDATES[code]} -- switching")
+            set_language(_AUTO_CANDIDATES[code])
+    else:
+        code = LANGUAGES[CURRENT_LANGUAGE]["whisper"]
+    if CLOUD_MODE:
+        try:
+            return _groq_transcribe(audio, code)
+        except Exception as e:
+            print(f"[krishna] cloud transcription failed, using local: {e}")
+    segments, _ = whisper_model.transcribe(audio, language=code)
     return " ".join(s.text.strip() for s in segments).strip()
 
 
-_TTS_UNSAFE_CHARS = re.compile(r"[^a-zA-Z0-9\s.,!?;:'\"()\-]")
+# ------------------------------------------------------------------- voices
+
+_TTS_DROP_CHARS = set("*#_~`|<>[]{}^\\@&+=")
+_TTS_SAFE_PUNCT = set(".,!?;:'\"()-¿¡«»।॥")
+_TTS_REPLACE = {"—": ", ", "–": ", ", "…": ".", "“": '"', "”": '"', "‘": "'",
+                "’": "'", " ": " ", " ": " "}
+# Spoken forms for what the cloud model writes but Kokoro would read as a
+# symbol or drop: "67 °F" came out as "67 F", and "$332.27" lost the dollars.
+_TTS_SPOKEN = [
+    (re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)"), r"\1 dollars"),
+    (re.compile(r"₹\s?(\d[\d,]*(?:\.\d+)?)"), r"\1 rupees"),
+    (re.compile(r"\s*°\s*F\b"), " degrees Fahrenheit"),
+    (re.compile(r"\s*°\s*C\b"), " degrees Celsius"),
+    (re.compile(r"\bkm/h\b"), " kilometers per hour"),
+    (re.compile(r"\bmph\b"), " miles per hour"),
+    (re.compile(r"(\d)\s*%"), r"\1 percent"),
+]
 
 
 def _sanitize_for_tts(text: str) -> str:
-    """Strips characters known to trigger Kokoro's G2P (misaki) crash --
-    emoji, markdown symbols (*, #), unusual unicode -- a defensive pass, not
-    a guarantee. _safe_tts_chunks() still catches whatever gets through."""
-    cleaned = _TTS_UNSAFE_CHARS.sub(" ", text)
-    return re.sub(r"\s+", " ", cleaned).strip()
+    """Strips what trips Kokoro's G2P -- emoji, symbols, markdown -- while
+    keeping every letter and combining mark. The previous ASCII-only
+    whitelist deleted accented and non-Latin letters outright: French
+    "réel" became "r el", and a full Hindi sentence came out as 0.6s of
+    audio because the Devanagari itself was being erased."""
+    for old, new in _TTS_REPLACE.items():
+        text = text.replace(old, new)
+    for pattern, spoken in _TTS_SPOKEN:
+        text = pattern.sub(spoken, text)
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if (ch in _TTS_DROP_CHARS or cat[0] in "SC"
+                or (cat[0] == "P" and ch not in _TTS_SAFE_PUNCT)):
+            out.append(" ")
+        else:
+            out.append(ch)
+    return re.sub(r"\s+", " ", "".join(out)).strip()
 
 
-# Each language: Whisper's language code, Kokoro's lang_code (a pipeline is
-# built per lang_code, not per voice), and a curated set of REAL Kokoro voice
-# IDs -- checked against the actual hexgrad/Kokoro-82M voices/ listing on
-# Hugging Face, same "verified real, not assumed from a naming convention"
-# bar as the original English-only picker.
+# Each language: Whisper's language code, Kokoro's lang_code, and a curated
+# set of REAL Kokoro voice IDs -- checked against the hexgrad/Kokoro-82M
+# voices/ listing on Hugging Face, not assumed from a naming convention.
 LANGUAGES: dict[str, dict] = {
     "English (US)": {
         "whisper": "en", "kokoro": "a",
@@ -343,27 +461,16 @@ LANGUAGES: dict[str, dict] = {
         "whisper": "pt", "kokoro": "p",
         "voices": {"Dora (female)": "pf_dora", "Alex (male)": "pm_alex"},
     },
-    # Japanese ('j') and Mandarin ('z') deliberately left out -- verified
-    # live that our installed kokoro==0.2.2 (many releases behind latest
-    # 0.7.16) never had these in its own LANG_CODES map at all, so no
-    # env/extra-package fix helps; Japanese's own extra (misaki[ja]) also
-    # needs compiling mojimoji from source, which needs Microsoft's C++
-    # Build Tools (a real, multi-GB system install) we don't have. Real fix
-    # is upgrading kokoro itself, a ~15-minor-version jump that deserves its
-    # own tested pass rather than a blind upgrade risking the already-
-    # verified English/avatar path -- see BACKLOG.md.
+    # Japanese ('j') and Mandarin ('z') deliberately left out -- the installed
+    # kokoro==0.2.2 never had them in its LANG_CODES map. Real fix is a kokoro
+    # upgrade, held for its own tested pass -- see BACKLOG.md.
 }
 
-# Indian languages, via Meta's MMS-TTS instead of Kokoro -- Kokoro has no
-# voice models for ANY of these except Hindi, so this is a second engine
-# rather than more entries for the first one. One ~145MB VITS model per
-# language, CPU-only, verified on Telugu at 2.8x realtime (fast enough for
-# conversation). Each takes its native script directly -- no G2P/espeak
-# layer, which is also why _safe_tts_chunks must NOT run its ASCII
-# sanitizer on these (it would erase the text entirely).
-# Honest limit: ONE voice per language, so no accent choice. Multiple
-# Telugu voices/accents needs AI4Bharat's IndicF5, which is a gated model
-# (needs an access request on your Hugging Face account) -- see BACKLOG.md.
+# Indian languages via Meta's MMS-TTS -- Kokoro has no voices for any of
+# these except Hindi. One ~145MB VITS model per language, CPU-only, verified
+# on Telugu at 2.8x realtime. Takes native script directly (no G2P/espeak).
+# Honest limit: ONE voice per language. Multiple Telugu voices need
+# AI4Bharat's IndicF5, a gated model -- see BACKLOG.md.
 _MMS_LANGUAGES = {
     "Telugu":    ("te", "tel"),
     "Tamil":     ("ta", "tam"),
@@ -384,84 +491,65 @@ for _name, (_whisper_code, _mms_code) in _MMS_LANGUAGES.items():
         "voices": {f"{_name} (MMS)": f"mms_{_mms_code}"},
     }
 
-# Hindi is the one overlap: Kokoro HAS Hindi voices (4 of them, already
-# above) and MMS has a Hindi model too. Kokoro's entry stays the default
-# since more voices is better; this adds the MMS one as an alternative
-# rather than replacing it.
+# Hindi is the one overlap: Kokoro has 4 Hindi voices and MMS has one. Auto
+# mode uses the MMS voice -- it's the one verified to speak full sentences.
 LANGUAGES["Hindi (MMS voice)"] = {
     "whisper": "hi", "engine": "mms", "mms": "hin",
     "voices": {"Hindi (MMS)": "mms_hin"},
 }
 
-# TalkingHead's own lip-sync viseme modules (checked against the real repo:
-# modules/lipsync-{de,en,fi,fr,lt}.mjs) only exist for these languages of
-# the ones above -- every other language can still speak fine through
-# Kokoro, it just can't drive the avatar's mouth shapes correctly. The UI
-# hides the avatar toggle outside this set rather than showing a mismatched
-# mouth (2026-09-13 decision: voice-only for the rest, not approximate
-# lip-sync).
+# TalkingHead's lip-sync viseme modules exist only for these of the languages
+# above; elsewhere the mouth timing is right but the shapes are approximate.
 AVATAR_CAPABLE_LANGUAGES = {"English (US)", "English (UK)", "French"}
 
 DEFAULT_LANGUAGE = "English (US)"
 CURRENT_LANGUAGE = DEFAULT_LANGUAGE
 CURRENT_VOICE = next(iter(LANGUAGES[DEFAULT_LANGUAGE]["voices"].values()))
+_VOICE_MEMORY: dict[str, str] = {}
 
 
 def set_language(name: str) -> None:
-    """Switches language AND resets the voice to that language's first
-    voice -- a voice ID is only valid inside its own language's Kokoro
-    pipeline, so leaving the old voice selected after a language switch
-    would silently point at the wrong pipeline's voice set."""
+    """Switches language and restores the voice last chosen for it (or its
+    first voice) -- a voice ID is only valid inside its own language's model."""
     global CURRENT_LANGUAGE, CURRENT_VOICE
     if name not in LANGUAGES:
         return
     CURRENT_LANGUAGE = name
-    CURRENT_VOICE = next(iter(LANGUAGES[name]["voices"].values()))
+    voices = list(LANGUAGES[name]["voices"].values())
+    remembered = _VOICE_MEMORY.get(name)
+    CURRENT_VOICE = remembered if remembered in voices else voices[0]
 
 
 def set_voice(voice_id: str) -> None:
     global CURRENT_VOICE
     CURRENT_VOICE = voice_id
+    _VOICE_MEMORY[CURRENT_LANGUAGE] = voice_id
 
 
-def _mms_synthesize(tts_cache: dict, text: str) -> np.ndarray:
-    """Meta's MMS-TTS, used for the Indian languages Kokoro has no voices
-    for at all. One model per language (~145MB), plain VITS through
-    transformers -- no espeak, no G2P layer, it takes the native script
-    directly. Cached in the same dict as Kokoro's pipelines, under an
-    'mms:<code>' key so the two engines can't collide, and evicted the same
-    way (see _get_tts_pipeline for why more than a few live models at once
-    corrupts the process)."""
-    import torch
-
-    tok, model = _mms_load(tts_cache)
-    inputs = tok(text, return_tensors="pt")
-    # An MMS tokenizer only knows its own script. Feeding Telugu's tokenizer
-    # Latin text yields ZERO tokens and the model then fails with "input
-    # size 0 ... resulted in a negative output size" -- hit live, both from
-    # warming up with the word "ok" and (more importantly) whenever the LLM
-    # answers in English while an Indian language is selected. Skip instead
-    # of crashing: better to go unspoken than to take the reply down.
-    if inputs["input_ids"].shape[-1] == 0:
-        print(f"[krishna] {CURRENT_LANGUAGE} voice can't pronounce "
-              f"{text[:40]!r} (wrong script) -- skipping speech.")
-        return np.array([], dtype=np.float32)
-    with torch.no_grad():
-        wave = model(**inputs).waveform
-    return wave.squeeze().cpu().numpy().astype(np.float32)
+def set_preferred_voice(language: str, voice_id: str) -> None:
+    """Remembers a voice for a language even when it isn't the current one --
+    Auto mode switches languages under you, and your English voice choice
+    shouldn't reset every time it does."""
+    global CURRENT_VOICE
+    _VOICE_MEMORY[language] = voice_id
+    if CURRENT_LANGUAGE == language:
+        CURRENT_VOICE = voice_id
 
 
-def _is_native_script(text: str) -> bool:
-    """Does this text contain characters the current MMS voice can actually
-    pronounce? Checked by Unicode block rather than by tokenizing, so the
-    decision happens before the model is even loaded."""
-    ranges = _SCRIPT_RANGES.get(LANGUAGES[CURRENT_LANGUAGE].get("mms"))
-    if not ranges:
-        return True
-    return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in text)
+@contextmanager
+def _speaking_as(name: str):
+    """Temporarily switch the speaking voice without losing the user's own
+    language/voice choice."""
+    global CURRENT_LANGUAGE, CURRENT_VOICE
+    saved = (CURRENT_LANGUAGE, CURRENT_VOICE)
+    set_language(name)
+    try:
+        yield
+    finally:
+        CURRENT_LANGUAGE, CURRENT_VOICE = saved
 
 
-# Unicode blocks per MMS language, for the check above.
+# Unicode blocks per MMS language.
 _SCRIPT_RANGES = {
     "tel": [(0x0C00, 0x0C7F)],   "tam": [(0x0B80, 0x0BFF)],
     "kan": [(0x0C80, 0x0CFF)],   "mal": [(0x0D00, 0x0D7F)],
@@ -471,54 +559,111 @@ _SCRIPT_RANGES = {
     "hin": [(0x0900, 0x097F)],   "mar": [(0x0900, 0x097F)],
 }
 
+_SCRIPT_VOICES = [   # (voice language, first code point, last code point)
+    ("Telugu", 0x0C00, 0x0C7F), ("Hindi (MMS voice)", 0x0900, 0x097F),
+    ("Tamil", 0x0B80, 0x0BFF), ("Kannada", 0x0C80, 0x0CFF),
+    ("Malayalam", 0x0D00, 0x0D7F), ("Bengali", 0x0980, 0x09FF),
+    ("Gujarati", 0x0A80, 0x0AFF), ("Punjabi", 0x0A00, 0x0A7F),
+    ("Odia", 0x0B00, 0x0B7F),
+]
+
+
+def _is_native_script(text: str) -> bool:
+    """Does this text contain characters the current MMS voice can pronounce?"""
+    ranges = _SCRIPT_RANGES.get(LANGUAGES[CURRENT_LANGUAGE].get("mms"))
+    if not ranges:
+        return True
+    return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in text)
+
+
+def _voice_for_text(text: str) -> str | None:
+    """Which voice should say this text? None means the current one is right.
+    Chosen by script: a Telugu reply is spoken by the Telugu voice even if the
+    language was left on English, and an English reply is never handed to an
+    MMS model (which can't pronounce Latin letters at all -- that used to
+    produce silence, which looks exactly like Krishna ignoring you)."""
+    count, best = max((sum(lo <= ord(c) <= hi for c in text), name)
+                      for name, lo, hi in _SCRIPT_VOICES)
+    engine = LANGUAGES[CURRENT_LANGUAGE].get("engine")
+    if count == 0:
+        return "English (US)" if engine == "mms" else None
+    if engine == "mms" and _is_native_script(text):
+        return None
+    if CURRENT_LANGUAGE == "Hindi" and best == "Hindi (MMS voice)":
+        return None   # Kokoro's Hindi voices read Devanagari themselves
+    return best
+
 
 def _mms_load(tts_cache: dict):
-    """Loads (and caches) the current language's MMS model WITHOUT running
-    inference -- kept separate from _mms_synthesize so warm-up doesn't have
-    to invent a sample string, which is what broke Telugu."""
+    """Loads (and caches) the current language's MMS model without inference."""
     from transformers import AutoTokenizer, VitsModel
 
     code = LANGUAGES[CURRENT_LANGUAGE]["mms"]
     key = f"mms:{code}"
     if key not in tts_cache:
-        tts_cache.clear()
+        _evict(tts_cache, "mms", keep=2)
         model_id = f"facebook/mms-tts-{code}"
         tts_cache[key] = (AutoTokenizer.from_pretrained(model_id),
                           VitsModel.from_pretrained(model_id))
     return tts_cache[key]
 
 
+def _mms_synthesize(tts_cache: dict, text: str) -> np.ndarray:
+    import torch
+
+    tok, model = _mms_load(tts_cache)
+    inputs = tok(text, return_tensors="pt")
+    # An MMS tokenizer only knows its own script; Latin text yields zero
+    # tokens and the model then fails. Skip rather than crash.
+    if inputs["input_ids"].shape[-1] == 0:
+        print(f"[krishna] {CURRENT_LANGUAGE} voice can't pronounce "
+              f"{text[:40]!r} (wrong script) -- skipping speech.")
+        return np.array([], dtype=np.float32)
+    with torch.no_grad():
+        wave = model(**inputs).waveform
+    return wave.squeeze().cpu().numpy().astype(np.float32)
+
+
+def prepare_voice(tts_cache: dict) -> None:
+    """Loads the current language's MMS model now rather than mid-reply,
+    where a first-time ~145MB download looks like an unexplained hang."""
+    if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms":
+        _mms_load(tts_cache)
+
+
+def prepare_voices(tts_cache: dict, names: list[str]) -> None:
+    for name in names:
+        if LANGUAGES.get(name, {}).get("engine") == "mms":
+            with _speaking_as(name):
+                _mms_load(tts_cache)
+
+
+def current_sample_rate() -> int:
+    """Kokoro is 24kHz, MMS-TTS is 16kHz."""
+    return 16000 if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms" else 24000
+
+
+_LAST_RATE = 24000   # sample rate of the most recently synthesized chunk
+
+
 def _safe_tts_chunks(tts_cache: dict, text: str):
-    """Kokoro's G2P can crash with `TypeError: unsupported operand type(s)
-    for +: 'NoneType' and 'str'` on certain text (a token gets no phonemes
-    assigned) instead of failing gracefully -- caught live, it took the
-    whole Streamlit app down mid-reply. Sanitizes first; if it STILL fails,
-    yields nothing rather than crashing, so a bad reply just goes unspoken
-    instead of taking the app down."""
-    lang = LANGUAGES[CURRENT_LANGUAGE]
-    if lang.get("engine") == "mms" and not _is_native_script(text):
-        # The selected voice can't pronounce this script -- most often
-        # because auto-detect switched to Telugu/Hindi and the model then
-        # answered in English. Falling back to the English voice means you
-        # still HEAR the reply; going mute (the old behaviour) just looks
-        # like Krishna ignored you.
-        print(f"[krishna] {CURRENT_LANGUAGE} voice can't pronounce this "
-              f"script -- speaking it in English instead.")
-        previous = CURRENT_LANGUAGE
-        try:
-            set_language("English (US)")
+    """Yields audio for text, switching to the right voice for its script.
+    Kokoro's G2P can raise on odd text; any TTS failure yields nothing so a
+    bad sentence goes unspoken instead of taking the app down. _LAST_RATE is
+    set before every yield -- the voice can change per sentence, so callers
+    must not assume the rate of whatever language is selected."""
+    global _LAST_RATE
+    target = _voice_for_text(text)
+    if target and target != CURRENT_LANGUAGE:
+        with _speaking_as(target):
             yield from _safe_tts_chunks(tts_cache, text)
-        finally:
-            set_language(previous)
         return
-    if lang.get("engine") == "mms":
-        # Deliberately NOT sanitized: _sanitize_for_tts strips everything
-        # outside ASCII, which would erase Telugu/Hindi/Tamil text entirely.
-        # That sanitizer exists for Kokoro's G2P crash, which MMS doesn't
-        # share -- it takes native script directly.
+    rate = current_sample_rate()
+    if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms":
         try:
             audio = _mms_synthesize(tts_cache, text.strip())
             if len(audio):
+                _LAST_RATE = rate
                 yield None, None, audio
         except Exception as e:
             print(f"[krishna] TTS failed on this text, skipping speech: {e}")
@@ -528,35 +673,18 @@ def _safe_tts_chunks(tts_cache: dict, text: str):
         return
     try:
         pipeline = _get_tts_pipeline(tts_cache)
-        yield from pipeline(safe_text, voice=CURRENT_VOICE)
+        for result in pipeline(safe_text, voice=CURRENT_VOICE):
+            _LAST_RATE = rate
+            yield result
     except Exception as e:
         print(f"[krishna] TTS failed on this text, skipping speech: {e}")
-        return
-
-
-def prepare_voice(tts_cache: dict) -> None:
-    """Loads the current language's model NOW rather than lazily mid-reply.
-    An MMS language pulls a ~145MB model on first use; doing that silently
-    inside a reply looks like an unexplained hang, so the UI calls this up
-    front where it can show what's happening."""
-    if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms":
-        _mms_load(tts_cache)
-
-
-def current_sample_rate() -> int:
-    """Kokoro is 24kHz, MMS-TTS is 16kHz. Playing one at the other's rate
-    is exactly the pitch/speed distortion already hit once with the avatar
-    (it defaulted to 22050 against Kokoro's 24000), so every playback site
-    asks here rather than hardcoding."""
-    return 16000 if LANGUAGES[CURRENT_LANGUAGE].get("engine") == "mms" else 24000
 
 
 VOLUME = 1.0
 
 
 def set_volume(level: float) -> None:
-    """1.0 = the model's own output level. Above 1.0 genuinely amplifies,
-    so it's clipped at playback to avoid the crackle of a wrapped waveform."""
+    """1.0 = the model's own level; above that amplifies (clipped at playback)."""
     global VOLUME
     VOLUME = max(0.0, float(level))
 
@@ -567,25 +695,35 @@ def _apply_volume(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio * VOLUME, -1.0, 1.0)
 
 
-def synthesize(tts_cache: dict, text: str) -> np.ndarray:
-    """Text -> raw float32 audio, no playback. Split out from speak() so the
-    avatar path can get the same audio Whisper will analyze for lip-sync
-    timing, instead of duplicating synthesis. Sample rate depends on the
-    engine -- see current_sample_rate()."""
+def synthesize_with_rate(tts_cache: dict, text: str) -> tuple[np.ndarray, int]:
     chunks = [audio for _, _, audio in _safe_tts_chunks(tts_cache, text)]
-    return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+    if not chunks:
+        return np.array([], dtype=np.float32), current_sample_rate()
+    return np.concatenate(chunks), _LAST_RATE
 
 
-def word_timing(whisper_model: WhisperModel, audio: np.ndarray) -> dict:
-    """Runs Whisper (already in this stack for speech-IN) on Krishna's own
-    generated speech-OUT to get real word-level timestamps -- this is the
-    local, no-cloud alternative to TalkingHead's default Google-Cloud-TTS-
-    based lip-sync timing. Returns {words, wtimes, wdurations} in the exact
-    shape TalkingHead's speakAudio() expects (times/durations in ms). Only
-    called for AVATAR_CAPABLE_LANGUAGES, but still reads CURRENT_LANGUAGE
-    rather than assuming English."""
+def synthesize(tts_cache: dict, text: str) -> np.ndarray:
+    return synthesize_with_rate(tts_cache, text)[0]
+
+
+def _resample(audio: np.ndarray, src: int, dst: int = SAMPLE_RATE) -> np.ndarray:
+    if src == dst or not len(audio):
+        return audio
+    n = int(round(len(audio) * dst / src))
+    return np.interp(np.linspace(0, len(audio) - 1, n),
+                     np.arange(len(audio)), audio).astype(np.float32)
+
+
+def word_timing(whisper_model: WhisperModel, audio: np.ndarray,
+                rate: int | None = None, text: str | None = None) -> dict:
+    """Word-level timestamps for Krishna's own speech, in the shape
+    TalkingHead's speakAudio() expects (ms). Audio is resampled to 16kHz
+    first: faster-whisper assumes 16kHz, so feeding it Kokoro's 24kHz audio
+    stretched every timestamp by 1.5x and the mouth lagged the voice."""
+    lang_key = (_voice_for_text(text) if text else None) or CURRENT_LANGUAGE
     segments, _ = whisper_model.transcribe(
-        audio, language=LANGUAGES[CURRENT_LANGUAGE]["whisper"], word_timestamps=True)
+        _resample(audio, rate or _LAST_RATE),
+        language=LANGUAGES[lang_key]["whisper"], word_timestamps=True)
     words, wtimes, wdurations = [], [], []
     for seg in segments:
         for w in seg.words:
@@ -597,16 +735,12 @@ def word_timing(whisper_model: WhisperModel, audio: np.ndarray) -> dict:
 
 def speak(tts_cache: dict, text: str) -> None:
     for _, _, audio in _safe_tts_chunks(tts_cache, text):
-        sd.play(_apply_volume(audio), samplerate=current_sample_rate())
+        sd.play(_apply_volume(audio), samplerate=_LAST_RATE)
         sd.wait()
 
 
 def _enter_pressed() -> bool:
-    """Non-blocking check: was Enter pressed since the last check? Windows-
-    only (msvcrt) -- fine here since this whole project targets your Windows
-    laptop. Used to let you cut Krishna off mid-sentence instead of having to
-    sit through the whole reply once it starts talking, same as a real
-    conversation lets you interrupt."""
+    """Non-blocking: was Enter pressed since the last check? Windows-only."""
     import msvcrt
     hit = False
     while msvcrt.kbhit():
@@ -616,12 +750,10 @@ def _enter_pressed() -> bool:
 
 
 def speak_interruptible(tts_cache: dict, text: str) -> bool:
-    """Same as speak(), but stops immediately if you press Enter while it's
-    talking. Returns True if you interrupted it, False if it finished on its
-    own -- the caller uses this to stop queuing more sentences once you've
-    clearly indicated you want to cut in."""
+    """Same as speak(), but stops immediately on an Enter press. Returns True
+    if interrupted."""
     for _, _, audio in _safe_tts_chunks(tts_cache, text):
-        sd.play(_apply_volume(audio), samplerate=current_sample_rate())
+        sd.play(_apply_volume(audio), samplerate=_LAST_RATE)
         while sd.get_stream().active:
             if _enter_pressed():
                 sd.stop()
@@ -630,67 +762,103 @@ def speak_interruptible(tts_cache: dict, text: str) -> bool:
     return False
 
 
-_SENTENCE_END = re.compile(r"[.!?]+(?:\s|$)")
+# ----------------------------------------------------------------- thinking
+
+# Hindi and Telugu writing often ends sentences with a danda, not a period.
+_SENTENCE_END = re.compile(r"[.!?।॥]+(?:\s|$)")
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts, start = [], 0
+    for m in _SENTENCE_END.finditer(text):
+        parts.append(text[start:m.end()].strip())
+        start = m.end()
+    parts.append(text[start:].strip())
+    return [p for p in parts if p]
+
+
+_SCRIPT_NAMES = {
+    "Telugu": "Telugu script", "Hindi": "Devanagari script", "Tamil": "Tamil script",
+    "Kannada": "Kannada script", "Malayalam": "Malayalam script",
+    "Marathi": "Devanagari script", "Bengali": "Bengali script",
+    "Gujarati": "Gujarati script", "Punjabi": "Gurmukhi script",
+    "Odia": "Odia script", "Assamese": "Assamese script",
+}
+
+
+def _language_note() -> dict | None:
+    """Per-turn instruction, never saved to memory.json. Without it the model
+    answered in English while Telugu was selected -- nothing had ever told it
+    which language to reply in."""
+    if AUTO_LANGUAGE:
+        text = ("Reply in the language the user just used. If they used Telugu or "
+                "Hindi -- in its own script or typed in English letters -- reply in "
+                "that language written in its native script (Telugu script or "
+                "Devanagari), not in English letters.")
+    else:
+        lang = CURRENT_LANGUAGE.replace(" (MMS voice)", "")
+        if lang.startswith("English"):
+            return None
+        script = _SCRIPT_NAMES.get(lang)
+        text = (f"Always reply in {lang}"
+                + (f", written in {script} -- never in English letters" if script else "")
+                + f" -- even if the user writes in English or types {lang} in English letters.")
+    return {"role": "system", "content": text}
+
+
+def _with_language_note(history: list) -> list:
+    note = _language_note()
+    return history + [note] if note else history
 
 
 _TOOL_FUNCS = {f.__name__: f for f in _tools.ALL_TOOLS}
 
-
-# Words that suggest a question actually needs live data. Deliberately
-# generous -- a false positive costs one slow pass (what every message used
-# to pay), while a false negative means answering from a stale training
-# cutoff, which is the whole problem this feature exists to fix.
+# Local-mode keyword gate. Deliberately generous -- a false positive costs one
+# slow pass, a false negative means answering from a stale training cutoff.
 _TOOL_HINTS = (
-    # weather
     "weather", "temperature", "forecast", "raining", "rain", "snow", "humid",
     "hot ", "cold ", "climate",
-    # money / currency
     "convert", "currency", "exchange rate", "usd", "eur", "inr", "gbp", "yen",
     "dollar", "rupee", "euro", "pound",
-    # stocks
     "stock", "share price", "shares", "ticker", "nasdaq", "dow", "s&p",
     "market", "trading at", "stock price",
-    # sports
     "score", "scored", "game", "match", "played", "beat", "won", "lost",
     "fixture", "league", "tournament",
-    # dictionary
     "define", "definition", "meaning of", "what does", "spell",
-    # jokes
     "joke", "funny", "make me laugh",
-    # price-shaped phrasings
     "how much is", "what is the price", "cost of",
-    # NOTE: bare time words ("today", "now", "currently", "latest") are
-    # deliberately NOT hints. They were, and "how are you doing today?"
-    # then paid the full 22s tool pass for an ordinary greeting. The
-    # domain words above already cover the real cases -- "price today"
-    # matches on "price", "weather today" on "weather".
+    # Bare time words ("today", "now") are deliberately NOT hints: they made
+    # "how are you doing today?" pay the full 22s tool pass.
 )
+_TOOL_HINT_WORDS = [h.strip() for h in _TOOL_HINTS if " " not in h.strip() and len(h.strip()) >= 4]
+
+
+def _text_hints_tool(text: str) -> bool:
+    text = text.lower()
+    if any(hint in text for hint in _TOOL_HINTS):
+        return True
+    # Typos: "hows wheater" missed the gate, no tool ran, and the model
+    # invented a forecast. Close-match single words against the hint words.
+    return any(difflib.get_close_matches(w, _TOOL_HINT_WORDS, n=1, cutoff=0.8)
+               for w in re.findall(r"[a-z]{4,}", text))
 
 
 def _might_need_tool(history: list) -> bool:
-    """Cheap keyword gate in front of the tool-detection pass. Measured: that
-    pass costs ~18s of a ~20s reply, because handing the model 6 tool schemas
-    bloats every prompt -- and it was running on EVERY message, including
-    "say hi" (where it even produced a bogus tool call). Gating it means
-    ordinary conversation skips the cost entirely and only genuinely
-    data-shaped questions pay it."""
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            text = str(msg.get("content", "")).lower()
-            return any(hint in text for hint in _TOOL_HINTS)
-    return False
+    """Cheap gate in front of the local tool-detection pass (measured at ~18s
+    of a ~20s reply). A short follow-up to a data question counts too -- "iselin
+    nj" right after a weather question is still a weather question."""
+    users = [str(m.get("content", "")) for m in history if m.get("role") == "user"]
+    if not users:
+        return False
+    if _text_hints_tool(users[-1]):
+        return True
+    return len(users) > 1 and len(users[-1].split()) <= 4 and _text_hints_tool(users[-2])
 
 
 def _resolve_tools(model: str, history: list) -> list:
-    """One non-streaming pre-pass to check if the model wants a live-data
-    tool (weather/currency/stocks/sports/dictionary/jokes -- see tools.py)
-    before actually answering. This is THE fix for "my knowledge cutoff is
-    December 2023": no local model can know anything past its training
-    cutoff no matter how it's prompted -- the only real fix is fetching live
-    data and handing it to the model as context for THIS answer.
-    Returns history unchanged if no tool was needed (the common case), or
-    history + the tool call + its real result appended, ready for the
-    caller to get a final answer grounded in that real data."""
+    """Local mode: one non-streaming pre-pass to see if the model wants a
+    live-data tool before answering. Returns history unchanged if not, or
+    with the tool call and its real result appended."""
     if not _might_need_tool(history):
         return history
     check = ollama.chat(model=model, messages=history, tools=_tools.ALL_TOOLS,
@@ -710,16 +878,11 @@ def _resolve_tools(model: str, history: list) -> list:
         except Exception as e:
             result = f"Tool call failed: {e}"
         results.append(str(result))
-        # `name` matters: without it the model doesn't connect the result to
-        # the call it just made, and llama3.2:3b would answer "I don't have
-        # real-time access" while literally holding the fetched value.
+        # Without `name`, llama3.2:3b didn't connect the result to its own call.
         working.append({"role": "tool", "name": name, "content": str(result)})
     if results:
-        # Belt and braces on top of the tool role. Even with a named tool
-        # message this model kept deflecting ("you can check a financial
-        # website") while holding the real number, so the data is also
-        # restated as a plain instruction it can't miss. Verified: this is
-        # what stopped the deflection.
+        # Even with a named tool message this model kept deflecting while
+        # holding the real number; restating it plainly is what stopped that.
         working.append({
             "role": "user",
             "content": ("Here is the real, current data just looked up for my "
@@ -732,33 +895,42 @@ def _resolve_tools(model: str, history: list) -> list:
     return working
 
 
+def _cloud_reply(history: list) -> str:
+    if not CLOUD_MODE:
+        return ""
+    try:
+        return _groq_think(_with_language_note(history))
+    except Exception as e:
+        print(f"[krishna] cloud reply failed, using local model: {e}")
+        return ""
+
+
 def think(model: str, history: list) -> str:
-    """Non-streaming reply, whole thing at once -- used by the avatar path,
-    which needs the complete text before it can synthesize+time it as one
-    piece. Trades away think_and_speak()'s first-sentence-latency win in
-    exchange for a simpler, correct avatar integration; the console/plain-
-    voice path keeps using think_and_speak() for that speed."""
-    history = _resolve_tools(model, history)
-    response = ollama.chat(model=model, messages=history, keep_alive=KEEP_ALIVE)
+    """Whole reply at once -- used by the avatar path, which needs the
+    complete text before it can synthesize and time it."""
+    reply = _cloud_reply(history)
+    if reply:
+        return reply
+    messages = _resolve_tools(model, _with_language_note(history))
+    response = ollama.chat(model=model, messages=messages, keep_alive=KEEP_ALIVE)
     return response["message"]["content"]
 
 
 def think_and_speak(tts_cache: dict, model: str, history: list) -> str:
-    """Streams the reply and speaks each completed SENTENCE as soon as it's
-    ready, instead of waiting for the entire response to finish generating
-    first -- first-sentence latency instead of full-reply latency, which is
-    most of what actually makes ChatGPT/Grok voice feel fast. keep_alive
-    keeps the model warm so only the very first turn in a session pays a
-    reload cost. Checks for an Enter-press between sentences too, so a long
-    reply can be cut off partway through, not just within one sentence.
-    Also checks for a live-data tool need first (weather/currency/etc,
-    same as think()) -- costs one extra non-streaming round trip on every
-    turn, but that's the price of Krishna reliably knowing to reach for
-    real data instead of guessing from a frozen training cutoff."""
-    history = _resolve_tools(model, history)
+    """Speaks the reply sentence by sentence, stopping on an Enter press.
+    Fast mode gets the whole reply from Groq in well under a second, so it
+    just speaks it; local mode streams tokens and starts on the first
+    finished sentence, which is most of what makes the slow path bearable."""
+    reply = _cloud_reply(history)
+    if reply:
+        for sentence in _split_sentences(reply):
+            if speak_interruptible(tts_cache, sentence):
+                break
+        return reply
+    messages = _resolve_tools(model, _with_language_note(history))
     buffer = ""
     full_reply = ""
-    stream = ollama.chat(model=model, messages=history, stream=True,
+    stream = ollama.chat(model=model, messages=messages, stream=True,
                          keep_alive=KEEP_ALIVE)
     interrupted = False
     for chunk in stream:
@@ -781,8 +953,9 @@ def think_and_speak(tts_cache: dict, model: str, history: list) -> str:
 
 def main() -> int:
     print("=" * 60)
-    print("  KRISHNA -- fully local voice companion")
-    print("  Nothing you say leaves this machine.")
+    print("  KRISHNA -- voice companion")
+    print("  Mode: " + ("fast (Groq cloud, local fallback)" if CLOUD_MODE
+                        else "fully local -- nothing leaves this machine"))
     print("=" * 60)
 
     whisper_model = _load_whisper()
@@ -790,8 +963,9 @@ def main() -> int:
     try:
         ollama.show(MODEL)
     except Exception:
-        print(f"[krishna] model '{MODEL}' not found -- run: ollama pull {MODEL}")
-        return 1
+        if not CLOUD_MODE:
+            print(f"[krishna] model '{MODEL}' not found -- run: ollama pull {MODEL}")
+            return 1
 
     history = load_history()
     remembered = len(history) - 1   # minus the system prompt
@@ -831,8 +1005,7 @@ def main() -> int:
         history.append({"role": "user", "content": text})
         t1 = time.time()
         reply = think_and_speak(tts, MODEL, history)
-        print(f"[krishna] {reply}  (first words spoken within a sentence of "
-              f"starting; {round(time.time()-t1, 1)}s total)")
+        print(f"[krishna] {reply}  ({round(time.time()-t1, 1)}s total)")
         history.append({"role": "assistant", "content": reply})
         save_history(history)
 

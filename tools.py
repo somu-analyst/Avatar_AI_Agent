@@ -52,20 +52,35 @@ def get_weather(location: str) -> str:
         location: City or place name, e.g. "New Jersey" or "Mumbai"
     """
     try:
+        # Open-Meteo's geocoder searches a bare place name, so "Iselin, NJ"
+        # finds nothing. Search the town, then use the part after the comma
+        # (a state, its initials, or a country) to pick the right match.
+        town, _, hint = location.partition(",")
+        hint = hint.strip().lower().replace(".", "")
         geo = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location, "count": 1}, timeout=10).json()
-        if not geo.get("results"):
+            params={"name": town.strip(), "count": 10}, timeout=10).json()
+        results = geo.get("results") or []
+        if not results:
             return f"Could not find a location matching '{location}'."
-        r = geo["results"][0]
-        lat, lon, name = r["latitude"], r["longitude"], r["name"]
+
+        def matches(res: dict) -> bool:
+            region = (res.get("admin1") or "").lower()
+            initials = "".join(w[0] for w in region.split())
+            return hint in (region, initials, (res.get("country_code") or "").lower(),
+                            (res.get("country") or "").lower())
+
+        r = next((res for res in results if hint and matches(res)), results[0])
+        lat, lon = r["latitude"], r["longitude"]
+        name = ", ".join(x for x in (r["name"], r.get("admin1")) if x)
         w = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={"latitude": lat, "longitude": lon, "current_weather": "true"},
             timeout=10).json()
         cw = w["current_weather"]
-        return (f"Current weather in {name}: {cw['temperature']}°C, "
-               f"wind {cw['windspeed']} km/h.")
+        temp_c = cw["temperature"]
+        return (f"Current weather in {name}: {temp_c}°C ({temp_c * 9 / 5 + 32:.0f}°F), "
+                f"wind {cw['windspeed']} km/h.")
     except Exception as e:
         return f"Weather lookup failed: {e}"
 

@@ -60,6 +60,9 @@ SAMPLE_RATE = 16000
 FRAME = 512                      # Silero's required frame size at 16kHz
 SILENCE_FRAMES = 28              # ~900ms of quiet ends the utterance
 BARGE_IN_FRAMES = 5              # ~160ms of speech while speaking = interrupt
+# Everything sent to the browser is resampled to one rate: the voice can change
+# per sentence (Kokoro 24kHz, MMS 16kHz) but the page and the avatar play at one.
+OUT_RATE = 24000
 
 app = FastAPI(title="Krishna Live")
 
@@ -188,14 +191,14 @@ class Session:
         generated, and so a barge-in can cut it off partway rather than
         only between whole replies."""
         loop = asyncio.get_running_loop()
-        sentences = [s.strip() for s in k._SENTENCE_END.split(text) if s.strip()]
+        sentences = k._split_sentences(text)
         self.speaking = True
         await self.send({"type": "speaking_start",
-                         "sample_rate": k.current_sample_rate()})
+                         "sample_rate": OUT_RATE})
         try:
             for sentence in sentences:
-                audio = await loop.run_in_executor(
-                    None, k.synthesize, _models["tts"], sentence)
+                audio, rate = await loop.run_in_executor(
+                    None, k.synthesize_with_rate, _models["tts"], sentence)
                 if audio is None or not len(audio):
                     continue
                 # Word timings ride ahead of each chunk so the avatar can
@@ -204,9 +207,10 @@ class Session:
                 # sentence, measured), pure waste with the avatar off.
                 if self.avatar:
                     timing = await loop.run_in_executor(
-                        None, k.word_timing, _models["whisper"], audio)
+                        None, k.word_timing, _models["whisper"], audio, rate, sentence)
                     await self.send({"type": "chunk_timing", **timing})
-                pcm = (np.clip(k._apply_volume(audio), -1, 1) * 32767).astype("<i2")
+                pcm = (np.clip(k._apply_volume(k._resample(audio, rate, OUT_RATE)), -1, 1)
+                       * 32767).astype("<i2")
                 await self.ws.send_bytes(pcm.tobytes())
         except asyncio.CancelledError:
             raise
@@ -222,8 +226,10 @@ async def ws_endpoint(ws: WebSocket):
     _load_models()
     session = Session(ws)
     await session.send({"type": "ready",
-                        "languages": list(k.LANGUAGES.keys()),
-                        "language": k.CURRENT_LANGUAGE})
+                        "cloud": k.CLOUD_MODE,
+                        "languages": [k.AUTO_LANGUAGE_LABEL] + list(k.LANGUAGES.keys()),
+                        "language": (k.AUTO_LANGUAGE_LABEL if k.AUTO_LANGUAGE
+                                     else k.CURRENT_LANGUAGE)})
     try:
         while True:
             msg = await ws.receive()
@@ -239,7 +245,10 @@ async def ws_endpoint(ws: WebSocket):
             elif "text" in msg and msg["text"]:
                 payload = json.loads(msg["text"])
                 if payload.get("type") == "set_language":
-                    k.set_language(payload["language"])
+                    chosen = payload["language"]
+                    k.set_auto_language(chosen == k.AUTO_LANGUAGE_LABEL)
+                    if chosen != k.AUTO_LANGUAGE_LABEL:
+                        k.set_language(chosen)
                     await session.send({"type": "status",
                                         "text": f"language: {payload['language']}"})
                 elif payload.get("type") == "set_avatar":

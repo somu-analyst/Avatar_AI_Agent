@@ -67,9 +67,8 @@
 <body>
 <div class="wrap">
   <h1>Krishna Live</h1>
-  <div class="sub">
-    Real barge-in — just start talking and it stops mid-sentence. Nothing
-    leaves this machine.
+  <div class="sub" id="sub">
+    Real barge-in — just start talking and it stops mid-sentence.
   </div>
 
   <div class="bar">
@@ -118,14 +117,33 @@ const AVATARS = {
     file: "vroid.glb", body: "F", avatarMood: "neutral",
     baseline: { headRotateX:-0.1, eyeBlinkLeft:0.05, eyeBlinkRight:0.05 }
   },
-  "Brunette (alternate build)": { file: "brunette-t.glb", body: "F", avatarMood: "neutral" }
+  "Brunette (alternate build)": { file: "brunette-t.glb", body: "F", avatarMood: "neutral" },
+  "MPFB (realistic proportions)": { file: "mpfb.glb", body: "F", avatarMood: "happy",
+    baseline: { headRotateX:-0.01, eyeBlinkLeft:0.05, eyeBlinkRight:0.05 } }
 };
 const BACKGROUNDS = {
-  "Charcoal": "#1a1a1a", "Slate": "#2b3137",
-  "Deep blue": "linear-gradient(160deg,#0f2027,#203a43,#2c5364)",
-  "Warm grey": "#3a3532", "Studio purple": "linear-gradient(160deg,#2b1055,#44318d)",
-  "Forest": "linear-gradient(160deg,#0b3d2c,#1d6f4d)",
-  "Sunset": "linear-gradient(160deg,#3a1c71,#d76d77,#ffaf7b)", "Plain white": "#f2f2f2"
+ "Wall Street -- NYSE trading floor": "url('/static/avatar/backgrounds/nyse-trading-floor-1.jpg') center / cover no-repeat",
+ "Wall Street -- NYSE floor (classic)": "url('/static/avatar/backgrounds/nyse-trading-floor-2.jpg') center / cover no-repeat",
+ "Wall Street -- NYSE facade": "url('/static/avatar/backgrounds/wall-street-1.jpg') center / cover no-repeat",
+ "Wall Street -- Charging Bull": "url('/static/avatar/backgrounds/charging-bull-1.jpg') center / cover no-repeat",
+ "Manhattan skyline (night)": "url('/static/avatar/backgrounds/manhattan-skyline-1.jpg') center / cover no-repeat",
+ "Manhattan skyline (day)": "url('/static/avatar/backgrounds/manhattan-skyline-2.jpg') center / cover no-repeat",
+ "Dalal Street -- BSE Mumbai": "url('/static/avatar/backgrounds/bse-dalal-street-1.jpg') center / cover no-repeat",
+ "Mumbai skyline (night)": "url('/static/avatar/backgrounds/mumbai-skyline-1.jpg') center / cover no-repeat",
+ "Mumbai skyline (day)": "url('/static/avatar/backgrounds/mumbai-skyline-2.jpg') center / cover no-repeat",
+ "Hyderabad -- Charminar": "url('/static/avatar/backgrounds/hyderabad-charminar-2.jpg') center / cover no-repeat",
+ "Hyderabad -- Charminar (detail)": "url('/static/avatar/backgrounds/hyderabad-charminar-1.jpg') center / cover no-repeat",
+ "Library": "url('/static/avatar/backgrounds/library-1.jpg') center / cover no-repeat",
+ "Library (modern)": "url('/static/avatar/backgrounds/library-2.jpg') center / cover no-repeat",
+ "Himalayas (snow lake)": "url('/static/avatar/backgrounds/himalayas-1.jpg') center / cover no-repeat",
+ "Himalayas (valley)": "url('/static/avatar/backgrounds/himalayas-2.jpg') center / cover no-repeat",
+ "Kerala backwaters": "url('/static/avatar/backgrounds/kerala-backwaters-1.jpg') center / cover no-repeat",
+ "Charcoal": "#1a1a1a",
+ "Slate": "#2b3137",
+ "Deep blue": "linear-gradient(160deg,#0f2027,#203a43,#2c5364)",
+ "Studio purple": "linear-gradient(160deg,#2b1055,#44318d)",
+ "Sunset": "linear-gradient(160deg,#3a1c71,#d76d77,#ffaf7b)",
+ "Plain white": "#f2f2f2"
 };
 
 const $ = id => document.getElementById(id);
@@ -134,7 +152,12 @@ const setStatus = t => $("status").textContent = t;
 function add(who, text, cls) {
   const d = document.createElement("div");
   d.className = "msg " + (cls || "");
-  d.innerHTML = `<div class="who">${who}</div><div>${text}</div>`;
+  const w = document.createElement("div");
+  w.className = "who";
+  w.textContent = who;
+  const t = document.createElement("div");
+  t.textContent = text;
+  d.append(w, t);
   $("log").appendChild(d);
   $("log").scrollTop = $("log").scrollHeight;
 }
@@ -216,6 +239,9 @@ async function start() {
     }
     const m = JSON.parse(ev.data);
     if (m.type === "ready") {
+      $("sub").textContent = m.cloud
+        ? "Real barge-in — just talk to interrupt. Fast mode: your voice and the conversation go to Groq; memory and Krishna's voice stay on this machine."
+        : "Real barge-in — just talk to interrupt. Fully local: nothing leaves this machine.";
       const sel = $("lang");
       sel.innerHTML = "";
       m.languages.forEach(l => {
@@ -310,7 +336,7 @@ Object.keys(BACKGROUNDS).forEach(n => {
   const o = document.createElement("option"); o.value = o.textContent = n;
   $("bg").appendChild(o);
 });
-$("avatarBox").style.background = BACKGROUNDS["Charcoal"];
+$("avatarBox").style.background = BACKGROUNDS[Object.keys(BACKGROUNDS)[0]];
 
 $("avatarOn").onchange = async e => {
   const on = e.target.checked;
