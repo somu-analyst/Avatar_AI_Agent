@@ -5,11 +5,11 @@
 Avatar AI (code name *Krishna*) is a voice assistant that listens, thinks and speaks entirely on your computer by default. A 3D avatar lip-syncs every reply, it answers time-sensitive questions with live data, and an optional fast cloud mode tells you exactly what leaves the machine before anything does.
 
 <p align="center">
-  <img src="static/avatar/backgrounds/manhattan-skyline-1.jpg" width="32%" alt="Manhattan skyline background">
-  <img src="static/avatar/backgrounds/himalayas-1.jpg" width="32%" alt="Himalayas background">
-  <img src="static/avatar/backgrounds/library-1.jpg" width="32%" alt="Library background">
+  <img src="docs/images/avatars.png" width="100%" alt="The five 3D avatars you can choose from">
 </p>
-<p align="center"><sub>Some of the photo backgrounds the avatar can stand in front of (credits in <a href="static/avatar/backgrounds/ATTRIBUTION.md">ATTRIBUTION.md</a>).</sub></p>
+<p align="center"><sub>Pick your assistant: five rigged 3D avatars, each lip-synced to the voice in real time.
+Rendered from the models in <code>static/avatar/avatars/</code> (Avaturn, TalkingHead sample, Avatar SDK MetaPerson, VRoid, MakeHuman MPFB — each under its creator's licence).
+Photo backgrounds such as Manhattan, the Himalayas or a library sit behind them (credits in <a href="static/avatar/backgrounds/ATTRIBUTION.md">ATTRIBUTION.md</a>).</sub></p>
 
 ---
 
@@ -19,7 +19,7 @@ Avatar AI (code name *Krishna*) is a voice assistant that listens, thinks and sp
 |---|---|
 | 🎙️ **Hands-free conversation** | Voice-activity detection (Silero VAD) starts and stops recording on its own; no buttons mid-sentence. |
 | ✋ **True barge-in** | Interrupt it while it's talking. A FastAPI + WebSocket server keeps audio flowing both ways, so it stops and listens. |
-| 🧑‍🎤 **3D avatar with lip-sync** | Six avatar models on the TalkingHead (three.js) engine; mouth shapes (visemes) are timed from the speech itself, in front of photo backgrounds. |
+| 🧑‍🎤 **3D avatar with lip-sync** | Five avatars (six models) on the TalkingHead (three.js) engine; mouth shapes (visemes) are timed from the speech itself, in front of photo backgrounds. |
 | 🌐 **Live answers, not stale memory** | LLM function calling fetches real data mid-conversation: weather, currency conversion, word definitions, stock prices, sports scores (and jokes). |
 | 🗣️ **Multilingual** | Auto-detects English, Hindi or Telugu, and replies in a matching voice; understands Telugu or Hindi typed in English letters ("ela unnav"). |
 | 🧠 **Remembers you** | Keeps conversation history and notes locally between sessions. |
