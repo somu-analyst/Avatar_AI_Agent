@@ -1,0 +1,4 @@
+# Third-party 3D-avatar engine (TalkingHead) and a demo notebook: not counted as this
+# project's language (the app itself is Python).
+static/avatar/*.mjs linguist-vendored
+*.ipynb linguist-documentation
